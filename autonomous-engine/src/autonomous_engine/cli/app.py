@@ -1163,6 +1163,141 @@ def reset(
     console.print("[green]reset:[/green] task graph cleared; the next `auto run` will plan again.")
 
 
+verify_app = typer.Typer(help="Verification evidence and quality-gate inspection (§51).")
+app.add_typer(verify_app, name="verify")
+
+
+@verify_app.command("task")
+def verify_task_cmd(
+    task_id: str = typer.Argument(...),
+    path: str = typer.Option("", "--path"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Re-run verification for one task and show the quality-gate verdict.
+
+    Records a real evidence commit; never mutates task state — the
+    orchestrator remains the only authority over transitions (§66).
+    """
+    from ..git.manager import GitManager
+    from ..runtime.permissions import ToolBox
+    from ..verification.engine import VerificationEngine
+    from ..verification.evidence import EvidenceRecord, EvidenceStore
+    from ..verification.gate import evaluate_quality_gate
+
+    context = _context(path)
+    try:
+        task = context.workspace.load_graph().get(task_id)
+    except KeyError:
+        _fail(f"unknown task: {task_id}")
+        return
+    git = GitManager(context.repo_root)
+    commit_sha = git.head_commit() if git.is_repo() else ""
+    tools = ToolBox(
+        work_root=context.repo_root,
+        permissions=context.config.permission_for("tester"),
+    )
+    report = VerificationEngine(tools).verify_task(task)
+    store = EvidenceStore(context.workspace.paths.state)
+    record, _ = EvidenceRecord.from_report(
+        report,
+        task_id=task.id,
+        round_number=len(store.history(task.id)) + 1,
+        commit_sha=commit_sha,
+        workspace_dirty=git.is_dirty(),
+    )
+    store.record(record)
+    gate = evaluate_quality_gate(
+        report,
+        context.config.verification,
+        task_declared_criteria=bool(task.definition_of_done or task.acceptance_criteria),
+        flaky_history=store.flaky_score(task.id),
+    )
+    payload = {
+        "task": task.id,
+        "gate": gate.as_dict(),
+        "evidence": record.model_dump(mode="json"),
+    }
+    if json_output:
+        _print_json(payload)
+        return
+    color = "green" if gate.ok else "red"
+    console.print(f"[{color}]quality gate: {gate.status.value}[/{color}]")
+    console.print(
+        f"checks {gate.checks_passed}/{gate.checks_total} · "
+        f"commands {gate.commands_executed} · commit {record.commit_sha[:12] or 'n/a'}"
+    )
+    for reason in gate.blocking_reasons[:5]:
+        console.print(f"  [red]blocking:[/red] {reason}")
+    for warning in gate.warnings[:5]:
+        console.print(f"  [yellow]warning:[/yellow] {warning}")
+    for missing in gate.missing_evidence[:5]:
+        console.print(f"  [yellow]missing:[/yellow] {missing}")
+
+
+@verify_app.command("history")
+def verify_history_cmd(
+    task_id: str = typer.Argument(...),
+    path: str = typer.Option("", "--path"),
+) -> None:
+    """Show the persisted evidence history for one task."""
+    from ..verification.evidence import EvidenceStore
+
+    context = _context(path)
+    records = EvidenceStore(context.workspace.paths.state).history(task_id)
+    if not records:
+        console.print(f"no evidence recorded for {task_id}")
+        return
+    table = Table(title=f"evidence history: {task_id}", show_header=True, header_style="bold")
+    table.add_column("evidence")
+    table.add_column("round")
+    table.add_column("commit")
+    table.add_column("result")
+    table.add_column("checks")
+    table.add_column("when")
+    for record in records:
+        table.add_row(
+            record.evidence_id,
+            str(record.round),
+            record.commit_sha[:12] or "n/a",
+            "PASS" if record.passed else "FAIL",
+            f"{record.checks_passed}/{record.checks_total}",
+            record.created_at,
+        )
+    console.print(table)
+
+
+@verify_app.command("stale")
+def verify_stale_cmd(
+    path: str = typer.Option("", "--path"),
+) -> None:
+    """List tasks whose latest evidence was produced against a different commit."""
+    from ..git.manager import GitManager
+    from ..verification.evidence import EvidenceStore
+
+    context = _context(path)
+    git = GitManager(context.repo_root)
+    current = git.head_commit() if git.is_repo() else ""
+    graph = context.workspace.load_graph()
+    stale = EvidenceStore(context.workspace.paths.state).stale_tasks(
+        list(graph.tasks), current
+    )
+    if not stale:
+        console.print("[green]no stale evidence[/green]")
+        return
+    for task_id, evidence_sha in stale:
+        console.print(f"[yellow]stale:[/yellow] {task_id} verified at {evidence_sha[:12]}, HEAD is {current[:12]}")
+    console.print("[dim]re-verify with: auto verify task <task-id>[/dim]")
+
+
+@verify_app.command("policy")
+def verify_policy_cmd(
+    path: str = typer.Option("", "--path"),
+) -> None:
+    """Show the project's quality-gate policy."""
+    context = _context(path)
+    _print_json(context.config.verification.model_dump(mode="json"))
+
+
 def main() -> None:
     app()
 

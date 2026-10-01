@@ -178,6 +178,24 @@ DEFAULT_MODEL_ROUTES: list[ModelRoute] = [
 ]
 
 
+class QualityGatePolicy(BaseModel):
+    """Project-configurable quality-gate policy (verification spec §50).
+
+    Schema-versioned and deterministic: the same evidence against the same
+    policy always produces the same gate verdict.
+    """
+
+    schema_version: int = 1
+    # At least one executed command (or machine-checkable criterion) is
+    # required to pass: agent assertions alone can never satisfy the gate.
+    require_executable_evidence: bool = True
+    # Manual (unverifiable) criteria block the gate instead of warning.
+    strict_manual_checks: bool = False
+    # A task whose verification history flip-flops (fail→pass→fail) requires
+    # a clean re-run before the gate passes again.
+    block_flaky_history: bool = True
+
+
 class ProjectConfig(BaseModel):
     """Machine-readable configuration for one autonomous-engine project."""
 
@@ -185,6 +203,7 @@ class ProjectConfig(BaseModel):
     project_name: str = "untitled"
     run_mode: RunMode = "autonomous"
     budget: BudgetConfig = Field(default_factory=BudgetConfig)
+    verification: QualityGatePolicy = Field(default_factory=QualityGatePolicy)
     permission_classes: dict[str, PermissionClass] = Field(
         default_factory=lambda: dict(DEFAULT_PERMISSION_CLASSES)
     )

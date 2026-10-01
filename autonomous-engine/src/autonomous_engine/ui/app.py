@@ -286,6 +286,14 @@ class DetailPanel(Static):
         if failed:
             lines += ["", "[bold red]failing[/bold red]"]
             lines += [f"  [red]✗[/red] {t['id']} {t['title'][:48]}" for t in failed[:8]]
+        # Latest evidence commit per task: evidence from an older commit is
+        # marked stale — it no longer proves the current tree (spec §14).
+        stale_ids = {
+            task_id for task_id, _sha in facade.stale_evidence_tasks()
+        }
+        if stale_ids:
+            lines += ["", "[bold yellow]stale evidence[/bold yellow]"]
+            lines += [f"  [yellow]…[/yellow] {task_id} — re-verify" for task_id in sorted(stale_ids)[:8]]
         self.set_text("\n".join(lines))
 
     def render_memory(self, facade: RuntimeFacade) -> None:

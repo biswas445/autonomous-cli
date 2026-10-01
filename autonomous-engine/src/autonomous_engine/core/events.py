@@ -79,6 +79,9 @@ class EventTypes:
 
     VERIFICATION_PASSED = "verification.passed"
     VERIFICATION_FAILED = "verification.failed"
+    EVIDENCE_RECORDED = "evidence.recorded"
+    QUALITY_GATE_EVALUATED = "quality_gate.evaluated"
+    FLAKY_TEST_DETECTED = "verification.flaky"
 
     COMMIT_CREATED = "git.commit"
     CHECKPOINT_CREATED = "checkpoint.created"

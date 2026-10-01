@@ -124,6 +124,24 @@ class RuntimeFacade:
                 unknown += 1
         return {"passed": passed, "failed": failed, "unknown": unknown}
 
+    def stale_evidence_tasks(self) -> list[tuple[str, str]]:
+        """(task_id, evidence commit) where latest evidence predates HEAD (§14)."""
+        from ..git.manager import GitManager
+        from ..verification.evidence import EvidenceStore
+
+        try:
+            git = GitManager(self.root)
+            current = git.head_commit() if git.is_repo() else ""
+        except Exception:
+            return []
+        if not current:
+            return []
+        store = EvidenceStore(self.workspace.paths.state)
+        try:
+            return store.stale_tasks(list(self.graph().tasks), current)
+        except Exception:
+            return []
+
     # ---- tasks / agents / models ----
 
     def tasks(self) -> list[dict[str, Any]]:

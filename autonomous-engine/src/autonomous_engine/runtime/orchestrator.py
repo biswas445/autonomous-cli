@@ -67,6 +67,8 @@ from ..messaging import (
 )
 from ..models.router import ModelRouter
 from ..verification.engine import CheckStatus, VerificationEngine, VerificationReport
+from ..verification.evidence import EvidenceRecord, EvidenceStore
+from ..verification.gate import evaluate_quality_gate
 from .base import AgentDeps, AgentResult, AgentRunner
 from .budget import BudgetManager
 from .constitution import ensure_constitution
@@ -159,6 +161,7 @@ class Orchestrator:
         self.config = context.config
         self.repo_root: Path = context.repo_root
         self.git = GitManager(self.repo_root)
+        self.evidence_store = EvidenceStore(self.workspace.paths.state)
         self.router = router or ModelRouter(self.config)
         self.on_event = on_event
         self.max_cycles = max_cycles
@@ -1975,7 +1978,55 @@ class Orchestrator:
                 summary=report.summary(),
                 failures=report.failures[:5],
             )
+        self._record_quality_gate(task, report)
         return report
+
+    def _record_quality_gate(self, task: Task, report: VerificationReport) -> None:
+        """Persist an evidence record and the deterministic gate verdict.
+
+        The gate is the auditable answer to "what proves this task?" — same
+        evidence + same policy always yields the same verdict, and an agent
+        claim without executable evidence can never produce PASSED (§48/§49).
+        """
+        try:
+            commit_sha = self.git.head_commit() if self.git.is_repo() else ""
+            dirty = self.git.is_dirty()
+        except Exception:
+            commit_sha, dirty = "", False
+        round_number = len(self.evidence_store.history(task.id)) + 1
+        record, _classes = EvidenceRecord.from_report(
+            report,
+            task_id=task.id,
+            round_number=round_number,
+            commit_sha=commit_sha,
+            workspace_dirty=dirty,
+        )
+        flaky = self.evidence_store.flaky_score(task.id)
+        self.evidence_store.record(record)
+        self.emit(
+            EventTypes.EVIDENCE_RECORDED,
+            task_id=task.id,
+            evidence_id=record.evidence_id,
+            commit=record.commit_sha[:12],
+            passed=record.passed,
+        )
+        if flaky:
+            self.emit(EventTypes.FLAKY_TEST_DETECTED, task_id=task.id)
+        gate = evaluate_quality_gate(
+            report,
+            self.config.verification,
+            task_declared_criteria=bool(task.definition_of_done or task.acceptance_criteria),
+            flaky_history=flaky,
+        )
+        self.emit(
+            EventTypes.QUALITY_GATE_EVALUATED,
+            task_id=task.id,
+            status=gate.status.value,
+            checks_passed=gate.checks_passed,
+            checks_total=gate.checks_total,
+            missing_evidence=gate.missing_evidence[:3],
+            commit=record.commit_sha[:12],
+        )
 
     def _diff_section(self, repo_root: Path | None = None) -> str:
         try:
