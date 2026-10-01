@@ -14,6 +14,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from ..models.base import Usage
 from ..runtime.base import Agent, AgentResult
 from ..runtime.context import AgentContext
 from ..runtime.permissions import PermissionDenied
@@ -97,8 +98,9 @@ class TesterAgent(Agent):
                 )
 
         generated: list[str] = []
+        generated_usage: Usage | None = None
         if task is not None and not self._has_existing_test_evidence(executed):
-            generated = await self._generate_missing_test(task, context, failures)
+            generated, generated_usage = await self._generate_missing_test(task, context, failures)
 
         status = "passed" if executed and not failures else ("failed" if failures else "unknown")
         report = TestReport(
@@ -120,6 +122,9 @@ class TesterAgent(Agent):
             confidence=report.confidence,
             evidence={"commands": len(executed), "failures": len(failures)},
             artifacts=generated,
+            cost_usd=generated_usage.cost_usd if generated_usage else 0.0,
+            tokens_in=generated_usage.tokens_in if generated_usage else 0,
+            tokens_out=generated_usage.tokens_out if generated_usage else 0,
         )
 
     # ---- helpers ----
@@ -148,10 +153,14 @@ class TesterAgent(Agent):
 
     async def _generate_missing_test(
         self, task, context: AgentContext, failures: list[str]
-    ) -> list[str]:
-        """Self-generated tests (plan.md §56): make the requirement executable."""
+    ) -> tuple[list[str], Usage | None]:
+        """Self-generated tests (plan.md §56): make the requirement executable.
+
+        Returns the written paths and the model usage — the caller adds the
+        usage to the AgentResult so this real spend reaches the budget.
+        """
         try:
-            payload, _usage = await self.ask_model(
+            payload, usage = await self.ask_model(
                 system=self.SYSTEM,
                 prompt=(
                     context.render()
@@ -165,7 +174,7 @@ class TesterAgent(Agent):
                 max_tokens=3000,
             )
         except Exception:
-            return []
+            return [], None
 
         written: list[str] = []
         for item in payload.get("generated_tests", []) or []:
@@ -187,7 +196,7 @@ class TesterAgent(Agent):
                 failures.append(f"generated test {path} could not be written: {exc}")
         if written:
             self.record_activity("generated tests", ", ".join(written))
-        return written
+        return written, usage
 
     def summarise(self, result: AgentResult) -> str:
         """Human-readable, evidence-first summary for the CLI."""

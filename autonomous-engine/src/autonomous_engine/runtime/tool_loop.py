@@ -162,8 +162,26 @@ class ToolLoop:
         return result
 
 
+_DENIED_PREFIXES = (
+    "permission denied",
+    "not permitted",
+    "unknown tool",
+    "tool error",
+    "blocked by network policy",
+    "high-risk command refused",
+    "not found",
+    "invalid arguments for",
+    "invalid base revision",
+    "refusing to store",
+)
+
+
 def _transcript_entry(call: ToolCall, observation: str) -> dict[str, Any]:
-    denied = observation.startswith(("permission denied", "not permitted", "unknown tool"))
+    # Denial/refusal observations must be recorded as failures: incident
+    # auditors rely on this transcript, so sniff every denial shape
+    # execute_tool and the permission layer can emit.
+    head = observation[:160].lower()
+    denied = head.startswith(_DENIED_PREFIXES) or " is not permitted" in head
     return {
         "tool": call.name,
         "arguments": {k: str(v)[:80] for k, v in (call.arguments or {}).items()},

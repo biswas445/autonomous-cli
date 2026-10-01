@@ -95,7 +95,12 @@ def run_case(case: BenchmarkCase, out_dir: Path, *, max_cycles: int | None = Non
     try:
         init_project(project_root, project_name=case.id, objective=case.goal)
         context = open_context(project_root)
-        orchestrator = Orchestrator(context, use_model_director=False)
+        # Honor the case/requested cycle cap: the orchestrator default (200)
+        # made run_benchmark(max_cycles=...) a silent no-op and let runaway
+        # cases run five times longer than the harness intended.
+        orchestrator = Orchestrator(
+            context, use_model_director=False, max_cycles=max_cycles or case.max_cycles
+        )
         run_result = asyncio_run(orchestrator.run_loop(case.goal))
         elapsed = time.perf_counter() - started
 

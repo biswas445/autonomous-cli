@@ -88,9 +88,17 @@ def default_agents() -> dict[str, AgentDescriptor]:
         "security": {"security", "review"},
         "qa": {"qa", "review"},
         "release": {"release"},
-        "director": {"coordination", "scheduling", "review"},
     }
-    return {name: AgentDescriptor(name, name, caps) for name, caps in roles.items()}
+    registry = {name: AgentDescriptor(name, name, caps) for name, caps in roles.items()}
+    # The director's runtime identity is DIRECTOR ("engineering-director"):
+    # register it so mailbox backpressure also guards the hottest mailbox,
+    # with role "director" so role-addressed mail resolves to the mailbox the
+    # DirectorInbox actually reads. SYSTEM likewise.
+    registry[DIRECTOR] = AgentDescriptor(
+        DIRECTOR, "director", {"coordination", "scheduling", "review"}
+    )
+    registry[SYSTEM] = AgentDescriptor(SYSTEM, "system", {"system"})
+    return registry
 
 
 class MessageService:
@@ -201,6 +209,7 @@ class MessageService:
             bucket.popleft()
         if len(bucket) >= self.rate_limit_per_minute:
             raise MessageRejected(f"rate limit exceeded for {sender}")
+        bucket.append(now)
 
         if parent is not None:
             correlation_id = correlation_id or parent.correlation_id or parent.id
@@ -317,9 +326,17 @@ class MessageService:
         return out
 
     def acknowledge(self, message: Message, note: str = "") -> None:
-        """ACK is 'received', never 'done' (§55)."""
-        if message.state in (DeliveryState.RECEIVED, DeliveryState.DELIVERED):
-            message.set_state(DeliveryState.ACKNOWLEDGED)
+        """ACK is 'received', never 'done' (§55). Coerces QUEUED/DELIVERED
+        through their legal intermediate states instead of raising."""
+        if message.state == DeliveryState.QUEUED:
+            message.set_state(DeliveryState.DELIVERED)
+            self.store.save(message)
+        if message.state == DeliveryState.DELIVERED:
+            message.set_state(DeliveryState.RECEIVED)
+            self.store.save(message)
+        if message.state in (DeliveryState.RECEIVED, DeliveryState.ACKNOWLEDGED):
+            if message.state == DeliveryState.RECEIVED:
+                message.set_state(DeliveryState.ACKNOWLEDGED)
             message.status_detail = note
             self.store.save(message)
             self._emit("message.acknowledged", message=message)
@@ -333,14 +350,23 @@ class MessageService:
         """Mark the message handled, coercing earlier states deterministically.
 
         Idempotent (§85): completing an already-completed message is a no-op,
-        never a second side effect.
+        never a second side effect. QUEUED/DELIVERED are walked forward along
+        legal edges rather than raising IllegalTransition.
         """
         if message.state == DeliveryState.COMPLETED:
             return
-        if message.state == DeliveryState.RECEIVED:
-            message.set_state(DeliveryState.ACKNOWLEDGED)
+        _forward = {
+            DeliveryState.CREATED: DeliveryState.QUEUED,
+            DeliveryState.QUEUED: DeliveryState.DELIVERED,
+            DeliveryState.DELIVERED: DeliveryState.RECEIVED,
+            DeliveryState.RECEIVED: DeliveryState.ACKNOWLEDGED,
+            DeliveryState.ACKNOWLEDGED: DeliveryState.PROCESSING,
+        }
+        while message.state in _forward:
+            message.set_state(_forward[message.state])
             self.store.save(message)
-        message.set_state(DeliveryState.COMPLETED)
+        if message.state == DeliveryState.PROCESSING:
+            message.set_state(DeliveryState.COMPLETED)
         message.status_detail = summary[:500]
         self.store.save(message)
         self._emit("message.completed", message=message)

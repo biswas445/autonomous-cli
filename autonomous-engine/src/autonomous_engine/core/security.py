@@ -117,17 +117,33 @@ _ENTROPY_ALLOWLIST = re.compile(
 )
 _QUOTED_LITERAL = re.compile(r"""["']([^"'
 ]{20,120})["']""")
+# A URL whose query string carries a credential-looking parameter is exactly
+# the leak shape (https://host/v1?key=WhNv...), so it must NOT hit the plain
+# URL allowlist below.
+_URL_WITH_CREDENTIAL = re.compile(
+    r"https?://\S*[?&]"
+    r"(?:api[-_]?key|access[-_]?token|auth|key|passwd|password|secret|sig(?:nature)?|token)=",
+    re.IGNORECASE,
+)
+_PLAIN_URL = re.compile(r"^https?://\S+$")
+# Unquoted credential assignments (key = WhNv3xP9...) bypass quoted-literal
+# scanning entirely.
+_UNQUOTED_CREDENTIAL = re.compile(
+    r"(?:api[-_]?key|access[-_]?token|auth[-_]?token|passwd|password|secret|token)"
+    r"\s*[:=]\s*([A-Za-z0-9_\-/+=.]{20,})",
+    re.IGNORECASE,
+)
 
 
 def find_high_entropy_strings(text: str) -> list[str]:
-    """Describe (never reveal) quoted literals that look like secrets.
+    """Describe (never reveal) string literals that look like secrets.
 
     Returns redacted descriptors: value length and entropy, never the value.
     """
     found: list[str] = []
     for match in _QUOTED_LITERAL.finditer(text):
         value = match.group(1)
-        if len(value) < _ENTROPY_MIN_LENGTH or _ENTROPY_ALLOWLIST.search(value):
+        if len(value) < _ENTROPY_MIN_LENGTH or _is_allowlisted_literal(value):
             continue
         classes = sum(
             bool(pattern.search(value))
@@ -138,7 +154,24 @@ def find_high_entropy_strings(text: str) -> list[str]:
         entropy = shannon_entropy(value)
         if entropy >= _ENTROPY_THRESHOLD:
             found.append(f"high-entropy literal ({len(value)} chars, {entropy:.1f} bits/char)")
+    for match in _UNQUOTED_CREDENTIAL.finditer(text):
+        value = match.group(1)
+        if len(value) < _ENTROPY_MIN_LENGTH or _is_allowlisted_literal(value):
+            continue
+        entropy = shannon_entropy(value)
+        if entropy >= _ENTROPY_THRESHOLD - 1.0:
+            found.append(
+                f"unquoted credential assignment ({len(value)} chars, {entropy:.1f} bits/char)"
+            )
     return found
+
+
+def _is_allowlisted_literal(value: str) -> bool:
+    if _URL_WITH_CREDENTIAL.search(value):
+        return False  # credential in a URL query is exactly what we flag
+    if _PLAIN_URL.match(value):
+        return True  # an ordinary URL without credential params is not a secret
+    return bool(_ENTROPY_ALLOWLIST.search(value))
 
 
 def find_secrets(text: str) -> list[str]:

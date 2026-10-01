@@ -99,11 +99,20 @@ _INVARIANTS: tuple[tuple[re.Pattern[str], CommandRisk, str], ...] = (
         CommandRisk.HIGH,
         "drive format",
     ),
+    # cmd.exe builtins and PowerShell: the flag must follow whitespace, so a
+    # path like `del build/something` is not mistaken for a /s switch.
     (
-        re.compile(
-            r"\b(Remove-Item|del|rd|rmdir)\b[^\n]*\b(-Recurse|-r)\b[^\n]*\b(-Force|-f)\b",
-            re.IGNORECASE,
-        ),
+        re.compile(r"\b(rd|rmdir)\b[^\n]*\s/s\b", re.IGNORECASE),
+        CommandRisk.HIGH,
+        "recursive directory removal (cmd rd /s)",
+    ),
+    (
+        re.compile(r"\bdel\b[^\n]*\s/s\b", re.IGNORECASE),
+        CommandRisk.HIGH,
+        "recursive file deletion (cmd del /s)",
+    ),
+    (
+        re.compile(r"\bRemove-Item\b[^\n]*\s-(Recurse|r)\b[^\n]*\s-(Force|f)\b", re.IGNORECASE),
         CommandRisk.HIGH,
         "recursive force delete",
     ),
@@ -244,16 +253,49 @@ def classify_command(command: str) -> RiskAssessment:
     return worst
 
 
-def _classify_segment(segment: str) -> RiskAssessment:
-    for pattern, risk, reason in _INVARIANTS:
-        if pattern.search(segment):
-            return RiskAssessment(risk, reason)
+def _rm_assessment(tokens: list[str]) -> RiskAssessment | None:
+    """Flag-set analysis for `rm`: `-f -r`, `--force --recursive` and `-rf`
+    are equally destructive, but a combined-flag regex only catches one
+    spelling. Returns None when no destructive flag combination is present
+    (plain `rm` then falls through to the UNKNOWN verb dispatch).
+    """
+    flags: set[str] = set()
+    operands: list[str] = []
+    for token in tokens[1:]:
+        if token == "--":
+            continue
+        if token.startswith("--"):
+            flags.add(token[2:].split("=", 1)[0].lower())
+        elif token.startswith("-") and len(token) > 1:
+            flags.update(token[1:])
+        else:
+            operands.append(token)
+    recursive = bool(flags & {"r", "R", "recursive"})
+    force = bool(flags & {"f", "force"})
+    if recursive and force:
+        return RiskAssessment(CommandRisk.HIGH, "recursive force delete")
+    if any(op in ("/", "/*", "~", "~/*", "*/") for op in operands):
+        return RiskAssessment(CommandRisk.HIGH, "delete of a root or home directory")
+    if recursive:
+        return RiskAssessment(CommandRisk.MEDIUM, "recursive delete")
+    return None
 
+
+def _classify_segment(segment: str) -> RiskAssessment:
     tokens = segment.split()
     verb = tokens[0].lower() if tokens else ""
     verb = verb.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]  # strip paths
     if verb.endswith(".exe"):
         verb = verb[:-4]
+    if verb == "rm":
+        assessment = _rm_assessment(tokens)
+        if assessment is not None:
+            return assessment
+
+    for pattern, risk, reason in _INVARIANTS:
+        if pattern.search(segment):
+            return RiskAssessment(risk, reason)
+
     if verb == "git":
         subcommand = tokens[1].lower() if len(tokens) > 1 else ""
         if subcommand in _SAFE_GIT_SUBCOMMANDS:

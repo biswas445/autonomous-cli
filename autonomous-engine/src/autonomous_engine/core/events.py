@@ -46,8 +46,12 @@ class EventLog:
         return self.read_all()[-n:]
 
     def tail_since(self, timestamp: str) -> list[dict[str, Any]]:
+        # >= rather than >: timestamps resolve to whole seconds, so a strict
+        # comparison permanently skipped events appended within the same
+        # second as the cursor. Re-read duplicates are dropped by the UI's
+        # dedup filter.
         events = self.read_all()
-        return [e for e in events if e.get("timestamp", "") > timestamp]
+        return [e for e in events if e.get("timestamp", "") >= timestamp]
 
 
 class EventTypes:

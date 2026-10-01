@@ -14,8 +14,8 @@ passing these checks.
 
 from __future__ import annotations
 
-import fnmatch
 import os
+import re
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +27,52 @@ from .risk import CommandRisk, classify_command
 
 class PermissionDenied(PermissionError):
     """Raised when an agent attempts an action outside its permission class."""
+
+
+_GLOB_CACHE: dict[str, re.Pattern[str]] = {}
+
+
+def _glob_to_regex(pattern: str) -> re.Pattern[str]:
+    """Compile a write-policy glob with path semantics.
+
+    fnmatch's `*` matches `/` too, so a class allowed `*.md` could write
+    `.agents/microagents/persist.md` (persistent prompt injection) or
+    `.git/hooks/x.md`. Here `**` crosses directories while `*` and `?`
+    stay within one path segment, matching what the configured patterns
+    mean. Case-insensitive on Windows, like fnmatch's normcase there.
+    """
+    cached = _GLOB_CACHE.get(pattern)
+    if cached is not None:
+        return cached
+    out: list[str] = []
+    i = 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "*":
+            if pattern[i : i + 2] == "**":
+                out.append(".*")
+                i += 2
+                continue
+            out.append("[^/]*")
+            i += 1
+        elif ch == "?":
+            out.append("[^/]")
+            i += 1
+        elif ch == "[":
+            end = pattern.find("]", i + 1)
+            if end == -1:
+                out.append(re.escape(ch))
+                i += 1
+            else:
+                out.append(pattern[i : end + 1])
+                i = end + 1
+        else:
+            out.append(re.escape(ch))
+            i += 1
+    flags = re.IGNORECASE if os.name == "nt" else re.NOFLAG
+    compiled = re.compile("".join(out) + r"\Z", flags)
+    _GLOB_CACHE[pattern] = compiled
+    return compiled
 
 
 def split_command(command: str) -> list[str]:
@@ -118,8 +164,12 @@ class ToolBox:
         if not self.permissions.write_paths:
             return False
         rel = resolved.relative_to(self.work_root).as_posix()
+        # Git internals are never agent-writable: hooks/config in .git are
+        # code execution waiting to happen. GitManager owns every git write.
+        if rel == ".git" or rel.startswith(".git/"):
+            return False
         for pattern in self.permissions.write_paths:
-            if fnmatch.fnmatch(rel, pattern):
+            if _glob_to_regex(pattern).match(rel):
                 return True
             # a bare directory pattern (e.g. "src") should cover its subtree
             if not any(ch in pattern for ch in "*?[") and (
@@ -288,9 +338,25 @@ class ToolBox:
             argv += ["--network", "none"]
         return [*argv, self.sandbox_image, *command_argv]
 
+    # The only git mutations a sandbox may perform via git_write; everything
+    # else (push, config, filter-branch…) goes through GitManager with its own
+    # orchestrator-controlled policy.
+    _GIT_WRITE_SUBCOMMANDS = {
+        "add", "branch", "checkout", "cherry-pick", "commit", "merge", "mv",
+        "rebase", "restore", "rm", "stash", "switch", "tag",
+    }
+
     def git_write(self, args: list[str]) -> str:
         if not self.permissions.git_write:
             raise PermissionDenied(f"{self.permissions.name} may not perform git writes")
+        if not args or args[0] not in self._GIT_WRITE_SUBCOMMANDS:
+            subcommand = args[0] if args else "<none>"
+            raise PermissionDenied(f"git {subcommand} is not an approved write subcommand")
+        # Same defense in depth as run_command: the risk analyzer decides
+        # what no agent may run, even inside an allowlisted subcommand.
+        assessment = classify_command("git " + " ".join(args))
+        if assessment.risk is CommandRisk.HIGH:
+            raise PermissionDenied(f"high-risk git operation refused: {assessment.reason}")
         argv = ["git", *args]
         proc = subprocess.run(  # noqa: S603 - argv list, shell=False
             argv, cwd=str(self.work_root), capture_output=True, text=True, check=False, shell=False

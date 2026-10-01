@@ -139,13 +139,19 @@ class EventAdapter:
     """Converts raw runtime events into ActivityItems (spec §37)."""
 
     def __init__(self) -> None:
-        self._seen: deque[tuple[str, str, str]] = deque(maxlen=_MAX_DEDUP)
+        self._seen: deque[tuple[str, str, str, str]] = deque(maxlen=_MAX_DEDUP)
 
     def convert(self, event: dict[str, Any]) -> ActivityItem | None:
         name = str(event.get("event", ""))
         if not name:
             return None
-        key = (name, str(event.get("timestamp", "")), str(event.get("task_id", "")))
+        # Timestamps resolve to whole seconds, so (name, timestamp, task_id)
+        # alone collapsed distinct events that shared a second (a fast
+        # QUEUED->ASSIGNED->IMPLEMENTING sequence lost its middle states).
+        # The record hash discriminates them while still deduplicating a
+        # re-read of the same event.
+        record = json.dumps(event, sort_keys=True, default=str)[:512]
+        key = (name, str(event.get("timestamp", "")), str(event.get("task_id", "")), record)
         if key in self._seen:  # duplicate protection (spec §61)
             return None
         self._seen.append(key)
@@ -172,16 +178,18 @@ class UIState:
 
     # ---- event intake ----
 
-    def ingest(self, events: list[dict[str, Any]]) -> int:
-        added = 0
+    def ingest(self, events: list[dict[str, Any]]) -> list[ActivityItem]:
+        """Convert and store events; returns the newly created items so the
+        caller can emit exactly those (never a re-slice of the filtered list)."""
+        fresh: list[ActivityItem] = []
         for event in events:
             item = self.adapter.convert(event)
             if item is not None:
                 self.activity.append(item)
-                added += 1
-        return added
+                fresh.append(item)
+        return fresh
 
-    def poll_events(self) -> int:
+    def poll_events(self) -> list[ActivityItem]:
         return self.ingest(self.facade.events_since())
 
     def load_recent(self, limit: int = MAX_ACTIVITY) -> None:

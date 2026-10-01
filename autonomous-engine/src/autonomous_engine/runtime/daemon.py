@@ -107,7 +107,20 @@ class DaemonLoop:
                     use_model_director=True,
                     on_event=self.on_event,
                 )
-                result = await orchestrator.run_loop()
+                try:
+                    result = await orchestrator.run_loop()
+                except Exception as exc:  # noqa: BLE001 - a crashed run is restartable
+                    # An unexpected exception must not kill the unattended
+                    # daemon: treat it like a retryable failure below.
+                    self._emit("daemon.run_crashed", run=report.runs + 1, error=str(exc)[:400])
+                    report.restarts += 1
+                    if report.restarts > self.max_restarts:
+                        report.status = "gave_up"
+                        report.reason = f"crashed {report.restarts} times: {exc}"[:200]
+                        self._emit("daemon.gave_up", reason=report.reason)
+                        return report
+                    await asyncio.sleep(self.poll_seconds)
+                    continue
                 report.runs += 1
                 report.cycles = max(report.cycles, result.cycles)
                 report.cost_usd += result.cost_usd
@@ -181,9 +194,13 @@ class DaemonLoop:
         while True:
             signal = self.control.read()
             if signal.stop:
+                # Consume the request: a stale stop on disk would otherwise
+                # halt the very next `auto run` at cycle 1 without any work.
+                self.control.clear()
                 return "stop"
             if reason == StopReason.PAUSED:
                 if signal.resume:
+                    self.control.clear()
                     return "resolved"
             elif not self.context.workspace.pending_escalations():
                 return "resolved"
@@ -215,8 +232,13 @@ class DaemonLoop:
                 requeued.append(task_id)
                 changed = True
             elif status == "rejected":
-                task.set_state(TaskState.CANCELLED, agent="daemon", note="human rejected the work")
-                cancelled.append(task_id)
+                # Cascade: dependents of rejected work can never run, so
+                # leaving them BLOCKED would make PROJECT_COMPLETE forever
+                # unreachable.
+                for cancelled_id in graph.cascade_cancel(
+                    task_id, agent="daemon", note="human rejected the work"
+                ):
+                    cancelled.append(cancelled_id)
                 changed = True
         if changed:
             self.context.workspace.save_graph(graph)

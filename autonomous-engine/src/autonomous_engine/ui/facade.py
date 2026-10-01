@@ -204,7 +204,9 @@ class RuntimeFacade:
         usage = self._usage_by_model()
         out: list[dict[str, Any]] = []
         for route in self.config.model_routes:
-            stats = usage.get(f"{route.provider}/{route.model}", {})
+            # record_usage stores the bare model id (no provider prefix), so
+            # the lookup key must match or the panel always shows zeros.
+            stats = usage.get(route.model, {})
             out.append(
                 {
                     "provider": route.provider,
@@ -224,12 +226,12 @@ class RuntimeFacade:
         try:
             rows = self.db().query(
                 """
-                SELECT agent, model, COUNT(*) AS calls,
+                SELECT model, COUNT(*) AS calls,
                        COALESCE(SUM(tokens_in), 0) AS tokens_in,
                        COALESCE(SUM(tokens_out), 0) AS tokens_out,
                        COALESCE(SUM(cost_usd), 0) AS cost_usd
                 FROM budget_usage WHERE project_id = ?
-                GROUP BY agent, model
+                GROUP BY model
                 """,
                 (self.store.project_id,),
             )
@@ -237,7 +239,7 @@ class RuntimeFacade:
             return {}
         out: dict[str, dict[str, Any]] = {}
         for row in rows:
-            key = f"{row['agent']}/{row['model']}"
+            key = str(row["model"])
             out[key] = {
                 "calls": int(row["calls"]),
                 "tokens_in": int(row["tokens_in"]),

@@ -19,10 +19,12 @@ Layout (created by `auto init`):
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from ..core.config import ProjectConfig
 from ..core.events import EventLog
@@ -121,9 +123,19 @@ def find_workspace(start: Path | None = None) -> WorkspacePaths | None:
 
 def atomic_write(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(path)
+    # A unique tmp name per writer: a shared ".tmp" makes two concurrent
+    # writers clobber each other's replace() on Windows. The fsync keeps the
+    # documented crash-safety promise (rename durable, contents too).
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid4().hex[:8]}.tmp")
+    try:
+        with tmp.open("w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp.replace(path)
+    except OSError:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def atomic_write_json(path: Path, payload: Any) -> None:
@@ -185,8 +197,14 @@ class Workspace:
             return ProjectConfig()
         try:
             return ProjectConfig.load(self.paths.config)
-        except Exception:
-            return ProjectConfig()
+        except Exception as exc:
+            # A malformed config must not silently downgrade the run: the
+            # defaults carry a much larger budget and looser policy than an
+            # operator who pinned them down would expect. Fail loudly instead.
+            raise ValueError(
+                f"invalid config file {self.paths.config}: {exc}; "
+                "fix or remove it — defaults are deliberately NOT substituted"
+            ) from exc
 
     def save_config(self, config: ProjectConfig) -> None:
         config.save(self.paths.config)

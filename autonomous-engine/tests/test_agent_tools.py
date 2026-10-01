@@ -181,6 +181,22 @@ def test_save_memory_rejects_secrets(tmp_path, project: Path):
     assert not memory_store(Workspace(project)).all()
 
 
+def test_save_memory_rejects_secrets_in_tags(tmp_path, project: Path):
+    """Regression: tags were persisted unchecked, so a credential could ride
+    into memory.json/MEMORY.md as metadata."""
+    from autonomous_engine.core.workspace import Workspace
+
+    tools = _toolbox(tmp_path)
+    tools.workspace = Workspace(project)
+    out = execute_tool(
+        tools,
+        "save_memory",
+        {"text": "innocent deployment note", "tags": "AKIAIOSFODNN7EXAMPLE, prod"},
+    )
+    assert out.startswith("refusing to store a potential secret")
+    assert not memory_store(Workspace(project)).all()
+
+
 def test_save_memory_without_workspace_is_graceful(tmp_path):
     out = execute_tool(_toolbox(tmp_path), "save_memory", {"text": "orphan fact"})
     assert "not available" in out
@@ -246,6 +262,116 @@ def test_web_fetch_blocks_loopback_even_with_permission(tmp_path):
     assert "blocked by network policy" in out
     out2 = execute_tool(tools, "web_fetch", {"url": "http://169.254.169.254/latest/meta-data"})
     assert "blocked by network policy" in out2
+
+
+def test_git_diff_rejects_flag_injection(tmp_path):
+    """Regression: a model-controlled `base` must not smuggle git flags like
+    --output=... or --no-index past the command allowlist."""
+    from autonomous_engine.runtime.tools import _git_diff
+
+    tools = ToolBox(
+        work_root=tmp_path,
+        permissions=PermissionClass(
+            name="tester",
+            read_repo=True,
+            write_paths=[],
+            run_commands=True,
+            allowed_command_globs=["git diff*"],
+            network=False,
+        ),
+    )
+    out = _git_diff(tools, "--output=C:/evil.txt HEAD")
+    assert "invalid base revision" in out
+    assert "invalid base revision" in _git_diff(tools, "--no-index secret.txt README.md")
+    # plausible revisions pass the guard and go on to real execution
+    assert "invalid base revision" not in _git_diff(tools, "HEAD~2")
+    assert "invalid base revision" not in _git_diff(tools, "abc123")
+    # classes lacking git diff still get the allowlist refusal first
+    assert "not permitted" in _git_diff(_toolbox(tmp_path), "HEAD")
+
+
+def test_web_fetch_revalidates_redirect_targets(tmp_path, monkeypatch):
+    """Regression: a public page must not be able to redirect the fetch into
+    loopback/private space — every redirect hop passes the endpoint policy."""
+    import contextlib
+
+    import httpx
+
+    from autonomous_engine.runtime.tools import _web_fetch
+
+    tools = _toolbox(tmp_path, network=True)
+    hops: list[str] = []
+
+    @contextlib.contextmanager
+    def fake_stream(method, url, **kwargs):
+        hops.append(str(url))
+        request = httpx.Request("GET", url)
+        if len(hops) == 1:
+            response = httpx.Response(
+                302,
+                headers={"location": "http://169.254.169.254/latest/meta-data"},
+                request=request,
+            )
+        else:
+            response = httpx.Response(200, text="metadata", request=request)
+        yield response
+
+    monkeypatch.setattr(httpx, "stream", fake_stream)
+    out = _web_fetch(tools, "https://example.com/page")
+    assert "blocked by network policy" in out
+    # the redirect target was validated and refused, never requested
+    assert hops == ["https://example.com/page"]
+
+
+def test_write_policy_stays_within_one_path_segment(tmp_path):
+    """Regression: fnmatch's `*` crosses `/`, so `*.md` allowed writing
+    .agents/microagents/persist.md (persistent prompt injection) and
+    .git/hooks/x.md. `*` must stay inside one segment; `**` crosses."""
+    from autonomous_engine.runtime.permissions import PermissionDenied
+
+    tools = ToolBox(
+        work_root=tmp_path,
+        permissions=PermissionClass(
+            name="coder",
+            read_repo=True,
+            write_paths=["src/**", "*.md", "*.toml"],
+            run_commands=False,
+            network=False,
+        ),
+    )
+    # still allowed
+    tools.write_file("src/app.py", "x = 1")
+    tools.write_file("README.md", "# hi")
+    tools.write_file("src/nested/deep.md", "ok")
+    # denied: `*` no longer crosses directories
+    for bad in (".agents/microagents/persist.md", "scripts/deploy.md", "docs/nested/x.toml"):
+        try:
+            tools.write_file(bad, "evil")
+            raise AssertionError(f"write to {bad} should have been denied")
+        except PermissionDenied:
+            pass
+
+
+def test_write_policy_never_touches_git_internals(tmp_path):
+    from autonomous_engine.runtime.permissions import PermissionDenied
+
+    tools = ToolBox(
+        work_root=tmp_path,
+        permissions=PermissionClass(
+            name="release",
+            read_repo=True,
+            write_paths=["**"],
+            run_commands=False,
+            network=False,
+        ),
+    )
+    tools.write_file("CHANGELOG.md", "# ok")
+    for bad in (".git/hooks/pre-commit", ".git/config"):
+        try:
+            tools.write_file(bad, "evil")
+            raise AssertionError(f"write to {bad} should have been denied")
+        except PermissionDenied:
+            pass
 
 
 # ---- sandbox wiring ----------------------------------------------------------

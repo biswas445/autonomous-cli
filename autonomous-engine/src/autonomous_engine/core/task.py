@@ -265,6 +265,37 @@ class TaskGraph(BaseModel):
             task.dependencies = [d for d in task.dependencies if d != task_id]
         self.updated_at = now_iso()
 
+    def cascade_cancel(
+        self, task_id: str, *, agent: str = "cascade", note: str = ""
+    ) -> list[str]:
+        """Cancel a task and every non-terminal task that transitively
+        depends on it.
+
+        Cancelled work can never complete, so its dependents would stay
+        BLOCKED forever and the project could never report completion.
+        Returns every cancelled task id, starting with `task_id` itself.
+        """
+        if task_id not in self.tasks:
+            return []
+        cancelled: list[str] = [task_id]
+        self.tasks[task_id].set_state(TaskState.CANCELLED, agent=agent, note=note)
+        frontier = [task_id]
+        while frontier:
+            current = frontier.pop()
+            for task in self.tasks.values():
+                if task.id in cancelled or task.is_terminal():
+                    continue
+                if current in task.dependencies:
+                    task.set_state(
+                        TaskState.CANCELLED,
+                        agent=agent,
+                        note=note or f"dependency {current} was cancelled",
+                    )
+                    cancelled.append(task.id)
+                    frontier.append(task.id)
+        self.updated_at = now_iso()
+        return cancelled
+
     # ---- queries ----
 
     def get(self, task_id: str) -> Task:

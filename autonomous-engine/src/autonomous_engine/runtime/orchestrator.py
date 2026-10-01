@@ -557,7 +557,20 @@ class Orchestrator:
                     break
 
             started = time.perf_counter()
-            report = await self._run_cycle()
+            try:
+                report = await self._run_cycle()
+            except Exception as exc:  # noqa: BLE001 - one bad cycle must not kill the run
+                # The cycle unwound mid-task: every in-process lock is stale
+                # now (nothing is executing), so release them all before the
+                # next selection or the run livelocks on lock_wait.
+                for owner in set(self.locks.snapshot().values()):
+                    self.locks.release(owner)
+                self.emit("cycle.error", cycle=self._cycle_index, error=str(exc)[:400])
+                report = CycleReport(
+                    action="cycle_error",
+                    ok=False,
+                    detail=f"unexpected cycle error: {exc}"[:400],
+                )
             report.index = self._cycle_index
             report.duration_s = round(time.perf_counter() - started, 2)
             self.history.append(report)
@@ -636,6 +649,10 @@ class Orchestrator:
         signal = self.control.read()
         if not signal.any_request():
             return
+        # Consume the file FIRST: an operator pause/stop written during the
+        # (multi-write) processing below was previously deleted unseen by the
+        # trailing clear().
+        self.control.clear()
         if signal.pause and not self._pause_requested:
             self._pause_requested = True
             self.emit(EventTypes.RUN_PAUSED, reason=signal.reason)
@@ -651,14 +668,38 @@ class Orchestrator:
             )
             self._pending_approvals.append(escalation_id)
             if item and item.get("task_id"):
-                self._approved_tasks.add(str(item["task_id"]))
+                task_id = str(item["task_id"])
+                self._approved_tasks.add(task_id)
                 self._persist_approved_tasks()
+                task = self.graph.tasks.get(task_id)
+                if task is not None and task.status == TaskState.ARCHITECTURE_REVIEW:
+                    # Mirror the daemon: an approved escalation requeues the
+                    # task, otherwise the next run stops with REPEATED_FAILURE
+                    # before doing any work.
+                    self._transition(
+                        task,
+                        TaskState.READY,
+                        agent="orchestrator",
+                        note="human approved another attempt",
+                    )
+                    self._persist_graph()
             self.emit("escalation.approved", escalation=escalation_id)
         for escalation_id in signal.rejections:
-            self.workspace.resolve_escalation(escalation_id, "rejected", "rejected by the operator")
+            item = self.workspace.resolve_escalation(
+                escalation_id, "rejected", "rejected by the operator"
+            )
             self._pending_rejections.append(escalation_id)
+            if item and item.get("task_id"):
+                task = self.graph.tasks.get(str(item["task_id"]))
+                if task is not None and task.status == TaskState.ARCHITECTURE_REVIEW:
+                    # Mirror the daemon: rejection cancels the task and its
+                    # dependents, who could never run otherwise.
+                    for cancelled_id in self.graph.cascade_cancel(
+                        task.id, agent="orchestrator", note="human rejected the work"
+                    ):
+                        self.emit(EventTypes.TASK_CANCELLED, task_id=cancelled_id)
+                    self._persist_graph()
             self.emit("escalation.rejected", escalation=escalation_id)
-        self.control.clear()
 
     # ==================================================================
     # bootstrap: intent -> requirements -> architecture -> plan
@@ -952,12 +993,15 @@ class Orchestrator:
         selected: list[str] = []
         for task_id in ordered:
             task = self.graph.get(task_id)
-            keys = resource_keys(list(task.artifacts) + list(task.locked_paths))
+            # Keys derive from declared artifacts only: locked_paths stores
+            # already-computed keys ("dir:src"), and re-feeding them through
+            # resource_keys minted junk like "dir:dir:src" on every restart.
+            keys = resource_keys(list(task.artifacts))
             acquired, blocking = self.locks.acquire(task_id, keys)
             if not acquired:
                 self.emit("task.lock_wait", task_id=task_id, blocked_by=blocking)
                 continue
-            task.locked_paths = sorted(set(task.locked_paths) | set(keys))
+            task.locked_paths = sorted(set(keys))
             selected.append(task_id)
             if len(selected) >= max(1, self.config.budget.max_parallel_agents):
                 break
@@ -1514,17 +1558,37 @@ class Orchestrator:
             )
 
         # ---- ANALYSE: independent review, weighted below executable evidence ----
+        blocked = await self._review_and_security(task, attempt, report)
+        if blocked is not None:
+            return blocked
+        return self._complete_task(task, attempt, result, report)
+
+    async def _review_and_security(
+        self,
+        task: Task,
+        attempt: AttemptRecord,
+        report: VerificationReport,
+        *,
+        work_root: Path | None = None,
+    ) -> CycleReport | None:
+        """Independent review + red-team pass before completion.
+
+        Shared by inline and worktree execution so a parallel task meets the
+        same completion contract as a sequential one. Returns a failed
+        CycleReport when a gate blocks the task, None to proceed.
+        """
+        repo = work_root if work_root is not None else self.repo_root
         if self._needs_review(task, report):
             self._transition(
                 task, TaskState.REVIEWING, agent="orchestrator", note="independent review"
             )
             reviewer = self.reviewer
-            reviewer.bind_tools(self.tools_for(reviewer.agent_class))
+            reviewer.bind_tools(self.tools_for(reviewer.agent_class, work_root=repo))
             review_context = self.context_builder.build(
                 task=task,
                 role="reviewer",
-                repo_root=self.repo_root,
-                extra_sections={"change_diff": self._diff_section()},
+                repo_root=repo,
+                extra_sections={"change_diff": self._diff_section(None if repo is self.repo_root else repo)},
             )
             review_result = await self.runner.run(reviewer, task, review_context)
             self._record_budget(review_result, reviewer.name)
@@ -1562,7 +1626,7 @@ class Orchestrator:
 
         # ---- SECURITY: high-risk changes get a red-team pass before completion ----
         if task.risk == "high":
-            security_result = await self._run_security(task)
+            security_result = await self._run_security(task, work_root=work_root)
             if security_result is not None and not security_result.ok:
                 return await self._fail_task(
                     task,
@@ -1571,7 +1635,7 @@ class Orchestrator:
                     agent="security",
                     report=report,
                 )
-        return self._complete_task(task, attempt, result, report)
+        return None
 
     def _needs_review(self, task: Task, report: VerificationReport) -> bool:
         """Deterministic review policy: risk and unverified criteria decide."""
@@ -1697,11 +1761,12 @@ class Orchestrator:
                 report.failures.append(f"{check.criterion} (not approved by review)")
         return False
 
-    async def _run_security(self, task: Task) -> AgentResult | None:
+    async def _run_security(self, task: Task, *, work_root: Path | None = None) -> AgentResult | None:
         """Red-team pass for high-risk work; static evidence plus model review."""
+        repo = work_root if work_root is not None else self.repo_root
         security = self.agents["security"]
-        security.bind_tools(self.tools_for(security.agent_class))
-        context = self.context_builder.build(task=task, role="security", repo_root=self.repo_root)
+        security.bind_tools(self.tools_for(security.agent_class, work_root=repo))
+        context = self.context_builder.build(task=task, role="security", repo_root=repo)
         result = await self.runner.run(security, task, context)
         self._record_budget(result, security.name)
         self.workspace.write_json_artifact(
@@ -1912,9 +1977,15 @@ class Orchestrator:
             )
         return report
 
-    def _diff_section(self) -> str:
+    def _diff_section(self, repo_root: Path | None = None) -> str:
         try:
-            diff = self.git.diff("HEAD")
+            # None = the main repository; a worktree path diffs that worktree
+            # (the changes live there until the merge).
+            diff = (
+                self.git.diff("HEAD")
+                if repo_root is None
+                else GitManager(repo_root).diff("HEAD")
+            )
         except GitError:
             return ""
         return f"# CHANGE DIFF\n```diff\n{diff[:20000]}\n```" if diff else ""
@@ -2209,7 +2280,7 @@ class Orchestrator:
         used_keys: set[str] = set()
         for task_id in task_ids:
             task = self.graph.get(task_id)
-            keys = resource_keys(list(task.artifacts) + list(task.locked_paths))
+            keys = resource_keys(list(task.artifacts))
             if waves[-1] and (used_keys.intersection(keys) or len(waves[-1]) >= 2):
                 waves.append([task_id])
                 used_keys = set(keys)
@@ -2232,6 +2303,12 @@ class Orchestrator:
                 if isinstance(outcome, CycleReport):
                     reports.append(outcome)
                 else:
+                    # The gather exception skipped every cleanup path; release
+                    # the task's locks or later waves lock_wait forever.
+                    self.locks.release(tid)
+                    task = self.graph.tasks.get(tid)
+                    if task is not None:
+                        task.locked_paths = []
                     reports.append(
                         CycleReport(
                             task_id=tid,
@@ -2325,6 +2402,12 @@ class Orchestrator:
                 agent="verifier",
                 report=report,
             )
+
+        # Same completion contract as inline execution: independent review and
+        # the red-team pass run here too, not only on the sequential path.
+        blocked = await self._review_and_security(task, attempt, report, work_root=work_root)
+        if blocked is not None:
+            return blocked
 
         attempt.outcome = "success"
         task.attempts_history.append(attempt)

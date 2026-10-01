@@ -1064,7 +1064,11 @@ def config(
         context.workspace.save_config(config_obj)
         if not json_output:
             console.print(f"[green]set[/green] {key} = {value}")
-    _print_json(config_obj.model_dump(mode="json"))
+    if json_output:
+        _print_json(config_obj.model_dump(mode="json"))
+    else:
+        for key, value in sorted(config_obj.model_dump(mode="json").items()):
+            console.print(f"{key}: {value}")
 
 
 def _set_run_mode(config_obj: ProjectConfig, value: str) -> None:

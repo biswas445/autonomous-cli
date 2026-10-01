@@ -170,7 +170,7 @@ class DirectorAgent(Agent):
             research_questions=as_list(payload.get("research_questions")),
             escalation=as_text(payload.get("escalation")),
             stop_reason=as_text(payload.get("stop_reason")),
-            goal_progress=max(0.0, min(1.0, float(payload.get("goal_progress") or 0.0))),
+            goal_progress=confidence(payload.get("goal_progress"), 0.0),
             assumptions_changed=as_list(payload.get("assumptions_changed")),
             new_risks=as_list(payload.get("new_risks")),
             confidence=confidence(payload.get("confidence"), 0.55),

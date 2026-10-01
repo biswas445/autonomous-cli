@@ -21,14 +21,14 @@ class ProjectRecord(BaseModel):
     objective: str = ""
     intent: dict[str, Any] = Field(default_factory=dict)
     status: str = "active"
-    created_at: str = now_iso()
-    updated_at: str = now_iso()
+    created_at: str = Field(default_factory=now_iso)
+    updated_at: str = Field(default_factory=now_iso)
 
 
 class RunRecord(BaseModel):
     id: str
     project_id: str
-    started_at: str = now_iso()
+    started_at: str = Field(default_factory=now_iso)
     finished_at: str | None = None
     status: str = "running"  # running | paused | stopped
     stop_reason: str = ""
@@ -44,7 +44,7 @@ class DecisionRecord(BaseModel):
     confidence: float = 0.5
     evidence: list[str] = Field(default_factory=list)
     decided_by: str = ""
-    created_at: str = now_iso()
+    created_at: str = Field(default_factory=now_iso)
 
 
 class FailureRecord(BaseModel):
@@ -56,7 +56,7 @@ class FailureRecord(BaseModel):
     root_cause: str = ""
     evidence: dict[str, Any] = Field(default_factory=dict)
     lesson: str = ""
-    created_at: str = now_iso()
+    created_at: str = Field(default_factory=now_iso)
 
 
 class UnknownRecord(BaseModel):
@@ -66,7 +66,7 @@ class UnknownRecord(BaseModel):
     status: str = "open"  # open | resolved
     answer: str = ""
     raised_by: str = ""
-    created_at: str = now_iso()
+    created_at: str = Field(default_factory=now_iso)
     resolved_at: str | None = None
 
 
@@ -87,7 +87,7 @@ class CheckpointRecord(BaseModel):
     environment: dict[str, Any] = Field(default_factory=dict)
     task_graph: dict[str, Any] = Field(default_factory=dict)
     project_state: dict[str, Any] = Field(default_factory=dict)
-    created_at: str = now_iso()
+    created_at: str = Field(default_factory=now_iso)
 
 
 _INSERT_UPSERT_TASK = """

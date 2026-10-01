@@ -41,6 +41,31 @@ def test_dod_parsing():
     assert kinds == ["command", "command", "file_exists", "file_contains", "file_absent", "manual"]
 
 
+def test_dod_prose_is_manual_not_a_command():
+    """Regression: 'Handles empty input gracefully' was parsed as a shell
+    command (first token looked path-like) and failed verification."""
+    dod = DefinitionOfDone(["Handles empty input gracefully", "pytest -q"])
+    checks = dod.checks()
+    assert checks[0].kind == "manual"
+    assert checks[1].kind == "command"
+
+
+def test_file_contains_handles_windows_absolute_paths(tmp_path: Path):
+    """Regression: the first-colon split turned 'D:\\repo\\app.py: needle'
+    into path 'D' and failed every Windows absolute-path criterion."""
+    (tmp_path / "app.py").write_text("def main():\n    pass\n", encoding="utf-8")
+    engine = _engine(tmp_path)
+    task = Task(
+        id="TASK-901",
+        title="win paths",
+        definition_of_done=[
+            f"file contains: {tmp_path / 'app.py'}: def main",
+        ],
+    )
+    report = engine.verify_task(task)
+    assert report.passed, report.failures
+
+
 def test_verification_passes_with_real_evidence(tmp_path: Path):
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "app.py").write_text("VALUE = 41\n", encoding="utf-8")

@@ -23,11 +23,15 @@ What all of them need is the same three things this module provides:
 
 from __future__ import annotations
 
+import contextlib
 import json
+import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+from uuid import uuid4
 
 MEMORY_FILENAME = "memory.json"
 EPISODES_FILENAME = "episodes.jsonl"
@@ -154,6 +158,14 @@ class MemoryStore:
                     if isinstance(raw, dict) and str(raw.get("text", "")).strip():
                         items.append(MemoryItem.from_dict(raw))
             except (json.JSONDecodeError, OSError):
+                # Quarantine the unreadable store instead of overwriting it on
+                # the next save() — corruption must not cause a silent,
+                # total loss of project memory.
+                quarantine = self.memory_path.with_suffix(
+                    f".corrupt.{int(time.time())}.json"
+                )
+                with contextlib.suppress(OSError):
+                    self.memory_path.replace(quarantine)
                 items = []
         elif (self.state_dir / "memory" / LEGACY_FACTS).is_file():
             items = self._migrate_legacy_facts()
@@ -188,9 +200,16 @@ class MemoryStore:
         items = self._load()
         self.memory_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"version": 1, "updated_at": _now(), "items": [i.as_dict() for i in items]}
-        tmp = self.memory_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self.memory_path)
+        # A unique tmp name per writer: two processes sharing one ".tmp" file
+        # clobber each other's replace() on Windows (PermissionError) and can
+        # interleave content.
+        tmp = self.memory_path.with_suffix(f".{os.getpid()}.{uuid4().hex[:8]}.tmp")
+        try:
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(self.memory_path)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            raise
         self._write_index()
 
     # ---- mutation ----

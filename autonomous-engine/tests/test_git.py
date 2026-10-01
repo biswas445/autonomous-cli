@@ -57,6 +57,29 @@ def test_worktree_lifecycle_and_merge(repo: GitManager):
     assert not worktree.exists()
 
 
+def test_merge_commits_uncommitted_worktree_changes(repo: GitManager):
+    """Regression: the orchestrator never commits inside the worktree, so the
+    merge must commit the verified working tree itself — otherwise the merge
+    is a no-op against the base commit and remove_worktree deletes the work."""
+    worktree = repo.create_worktree("TASK-98")
+    assert worktree is not None
+    (worktree / "feature.txt").write_text("feature", encoding="utf-8")
+    merged = repo.merge_validated_worktree("TASK-98", "merge task TASK-98")
+    assert len(merged) == 40
+    assert (repo.repo_root / "feature.txt").read_text(encoding="utf-8") == "feature"
+    repo.remove_worktree("TASK-98")
+    assert not worktree.exists()
+
+
+def test_merge_clean_worktree_is_a_no_op(repo: GitManager):
+    worktree = repo.create_worktree("TASK-97")
+    assert worktree is not None
+    before = repo.head_commit()
+    merged = repo.merge_validated_worktree("TASK-97", "merge task TASK-97")
+    assert merged == before
+    repo.remove_worktree("TASK-97")
+
+
 def test_merge_conflict_aborts_cleanly(repo: GitManager):
     worktree = repo.create_worktree("TASK-77")
     assert worktree is not None

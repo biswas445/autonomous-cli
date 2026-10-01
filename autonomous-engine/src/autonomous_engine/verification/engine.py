@@ -98,6 +98,16 @@ class DefinitionOfDone:
     _FILE_EXISTS = {"file exists:", "file exists ", "exists:"}
     _FILE_CONTAINS = {"file contains:", "contains:"}
     _FILE_ABSENT = {"file absent:", "absent:", "no file:"}
+    # A bare line is only treated as a command when it starts with a known
+    # runner; the old "first token looks path-like" heuristic classified prose
+    # such as "Handles empty input gracefully" as a shell command, which then
+    # failed verification on a PermissionError. Explicit `run:` prefixes are
+    # the escape hatch for anything else.
+    _RUNNERS = {
+        "bash", "bun", "cargo", "deno", "dotnet", "go", "gradle", "java", "make",
+        "mypy", "mvn", "node", "npm", "npx", "pip", "pnpm", "poetry", "py",
+        "python", "python3", "pytest", "ruff", "sh", "tox", "tsc", "uv", "yarn",
+    }
 
     def __init__(self, criteria: list[str]):
         self.criteria = criteria
@@ -127,14 +137,8 @@ class DefinitionOfDone:
                     criterion=raw, kind="file_absent", spec=cleaned[len(prefix) :].strip()
                 )
 
-        # bare line: treat as a command if it looks like one (first token has
-        # no spaces and no sentence punctuation), otherwise manual.
-        first = cleaned.split(" ", 1)[0] if cleaned else ""
-        if (
-            first
-            and re.fullmatch(r"[A-Za-z0-9_./-]+", first)
-            and not cleaned.endswith((".", "!", "?"))
-        ):
+        first = cleaned.split(" ", 1)[0].lower() if cleaned else ""
+        if first in self._RUNNERS:
             return DoDCheck(criterion=raw, kind="command", spec=cleaned)
         return DoDCheck(criterion=raw, kind="manual", spec=cleaned)
 
@@ -236,7 +240,19 @@ class VerificationEngine:
             return
 
         if check.kind == "file_contains":
-            path, sep, needle = check.spec.partition(":")
+            # The path may be a Windows absolute path ("C:\repo\app.py"), so a
+            # naive first-colon split would yield path "C". Split on the last
+            # colon that still leaves a plausible path, by splitting on ": "
+            # first and falling back to a drive-letter-aware split.
+            spec = check.spec
+            if re.match(r"^[A-Za-z]:", spec):
+                # drive-letter path: the separator is the first colon after
+                # the drive ("C:\path: needle")
+                drive, _, rest = spec.partition(":")
+                path, sep, needle = rest.partition(":")
+                path = drive + ":" + path
+            else:
+                path, sep, needle = spec.partition(":")
             if not sep:
                 check.status = CheckStatus.FAIL
                 check.detail = (

@@ -42,8 +42,12 @@ def test_event_log_tail_since(tmp_path: Path):
     log = EventLog(tmp_path / "events.jsonl")
     log.append("a", timestamp="2026-01-01T00:00:00Z")
     log.append("b", timestamp="2026-01-02T00:00:00Z")
-    later = log.tail_since("2026-01-01T00:00:00Z")
+    later = log.tail_since("2026-01-01T00:00:01Z")
     assert [e["event"] for e in later] == ["b"]
+    # same-second events are included (>= cursor): a strict > skipped events
+    # appended within the same second the UI had already seen
+    same_second = log.tail_since("2026-01-01T00:00:00Z")
+    assert [e["event"] for e in same_second] == ["a", "b"]
 
 
 # ---- store -----------------------------------------------------------------
@@ -139,3 +143,18 @@ def test_budget_usage_aggregation(tmp_path: Path):
     assert usage.tokens_out == 150
     assert abs(usage.cost_usd - 0.03) < 1e-9
     assert usage.calls == 2
+
+
+def test_record_timestamps_are_per_instance():
+    """Regression: default timestamps were frozen at module import time, so
+    every decision/failure/checkpoint record got the process-start time."""
+    import time
+
+    from autonomous_engine.core import store as store_module
+
+    before = store_module.now_iso()
+    time.sleep(1.1)
+    record = store_module.DecisionRecord(id="D1", project_id="P", title="a")
+    other = store_module.FailureRecord(id="F1", project_id="P", summary="s")
+    assert record.created_at > before
+    assert other.created_at > before

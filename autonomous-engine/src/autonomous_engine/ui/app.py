@@ -396,8 +396,12 @@ class ActivityFeed(RichLog):
         color = STYLE.get(item.kind, "dim")
         task = f" [magenta]{item.task_id}[/magenta]" if item.task_id else ""
         actor = f"[bold]{item.actor[:24]}[/bold]"
+        # The message is raw runtime/model text: an unbalanced '[' would raise
+        # MarkupError inside write() and kill the app — escape it like
+        # DetailPanel._safe does (comms spec §71).
+        message = str(item.message).replace("[", "\\[")
         self.write(
-            f"[dim]{item.time()}[/dim] [{color}]{item.event}[/] {actor}{task}\n  {item.message}"
+            f"[dim]{item.time()}[/dim] [{color}]{item.event}[/] {actor}{task}\n  {message}"
         )
 
 
@@ -418,9 +422,15 @@ HELP_TEXT = """[bold reverse] AUTONOMOUS ENGINEERING RUNTIME — HELP [/bold rev
   /status | /tasks     one-shot status / task list into the feed
   /filter <text>       filter the activity feed (agent/task/event text)
   /filter clear        clear the filter
-  /inspect TASK-003    open full task detail
+  /inspect TASK-003    open full task detail (or /inspect msg-... for a message)
   /remember <fact>     persist a durable fact into project memory
   /pause /resume /stop control the run through the real control channel
+  /approve [id|all]    approve pending escalation(s) (plain /a approves the first)
+  /reject [id|all]     reject pending escalation(s)
+  /budget              spend, token usage and pending-approval count
+  /metrics             project metrics (tasks, retries, verification, events)
+  /roadmap             milestone list and their status
+  /config              current project configuration
   /mode                show the Intent Compiler toggle state
 
 Everything displayed is real runtime state; nothing is simulated."""
@@ -503,11 +513,15 @@ class EngineTUI(App):
         self.set_interval(REFRESH_SECONDS, self.on_tick)
 
     async def on_tick(self) -> None:
-        added = self.state.poll_events()
-        if added:
+        fresh = self.state.poll_events()
+        if fresh:
             feed = self.query_one(ActivityFeed)
-            for item in self.state.visible_activity()[-added:]:
-                feed.emit_item(item)
+            # Emit exactly the new items, applying the filter per item —
+            # re-slicing visible_activity() replayed old lines whenever a
+            # non-matching event arrived while a filter was active.
+            for item in fresh:
+                if item.matches(self.state.filter_text):
+                    feed.emit_item(item)
         self.refresh_all()
 
     # ---- rendering ----
@@ -644,6 +658,63 @@ class EngineTUI(App):
             self._push("resume requested (control channel)", "success")
         elif command == "stop":
             await self.action_cancel_run()
+        elif command in ("approve", "a"):
+            pending = self.state.pending_escalations()
+            if argument.lower() == "all":
+                targets = [str(i.get("id", "")) for i in pending]
+            elif argument:
+                targets = [argument]
+            else:
+                targets = [str(pending[0].get("id", ""))] if pending else []
+            if not targets:
+                self._push("no pending approvals", "info")
+            for escalation_id in targets:
+                if self.facade.approve(escalation_id):
+                    self._push(f"approved escalation {escalation_id}", "success")
+                else:
+                    self._push(f"could not approve {escalation_id}", "warning")
+        elif command in ("reject", "j"):
+            pending = self.state.pending_escalations()
+            if argument.lower() == "all":
+                targets = [str(i.get("id", "")) for i in pending]
+            elif argument:
+                targets = [argument]
+            else:
+                targets = [str(pending[0].get("id", ""))] if pending else []
+            if not targets:
+                self._push("no pending approvals", "info")
+            for escalation_id in targets:
+                if self.facade.reject(escalation_id):
+                    self._push(f"rejected escalation {escalation_id}", "warning")
+                else:
+                    self._push(f"could not reject {escalation_id}", "warning")
+        elif command == "budget":
+            snapshot = self.facade.budget_snapshot()
+            spend = ", ".join(f"{k}={v}" for k, v in snapshot.items()) or "no spend recorded yet"
+            self._push(
+                f"budget: {spend} · pending approvals "
+                f"{len(self.state.pending_escalations())}",
+                "decision",
+            )
+        elif command == "metrics":
+            from ..runtime.metrics import collect_metrics
+
+            data = collect_metrics(self.facade.workspace, self.facade.store)
+            for key, value in data.items():
+                if isinstance(value, (int, float, str)):
+                    self._push(f"metrics.{key}: {value}", "decision")
+        elif command == "roadmap":
+            milestones = self.facade.milestones()
+            if not milestones:
+                self._push("roadmap: no milestones recorded yet", "info")
+            for milestone in milestones:
+                self._push(
+                    f"{milestone.get('id', '?')} [{milestone.get('status', '?')}] "
+                    f"{str(milestone.get('title', ''))[:60]}"
+                )
+        elif command == "config":
+            for key, value in sorted(self.facade.config.model_dump(mode="json").items()):
+                self._push(f"config.{key}: {value}", "decision")
         elif command == "mode":
             enabled = self.facade.enhance_prompt_enabled()
             self._push(f"Intent Compiler: {'ON' if enabled else 'OFF'} (press e to toggle)")

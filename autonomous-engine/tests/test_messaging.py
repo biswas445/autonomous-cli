@@ -521,3 +521,55 @@ async def test_failure_exhausting_attempts_escalates_via_the_inbox(project, echo
     assert any("TASK-ESC" in str(e.get("task_id", "")) or "TASK-ESC" in str(e) for e in escalations)
     assert orch.messaging.store.get(report.id).state == DeliveryState.COMPLETED
     context.db.close()
+
+
+async def test_rate_limiter_actually_limits_floods(service):
+    """§68 regression: the sliding window was pruned and checked but nothing
+    was ever appended to it, so flood protection could never trigger."""
+    from autonomous_engine.messaging.service import MessageRejected
+
+    service.rate_limit_per_minute = 3
+    for i in range(3):
+        service.send(
+            msg_type=MsgType.STATUS_RESPONSE,
+            sender="tester",
+            recipient="orchestrator",
+            payload={"status": f"n{i}"},
+        )
+    with pytest.raises(MessageRejected, match="rate limit"):
+        service.send(
+            msg_type=MsgType.STATUS_RESPONSE,
+            sender="tester",
+            recipient="orchestrator",
+            payload={"status": "flood"},
+        )
+
+
+async def test_director_mailbox_has_backpressure(service):
+    """§34 regression: the registry keyed the director as 'director' while the
+    runtime sends to DIRECTOR ('engineering-director'), so the hottest mailbox
+    skipped the mailbox-full check entirely."""
+    from autonomous_engine.messaging.models import DIRECTOR
+
+    assert DIRECTOR in service.agents, "director identity must be registered"
+    service.agents[DIRECTOR].mailbox_limit = 1
+    service.send(
+        msg_type=MsgType.STATUS_RESPONSE,
+        sender="tester",
+        recipient=DIRECTOR,
+        payload={"status": "first"},
+    )
+    with pytest.raises(MailboxFull):
+        service.send(
+            msg_type=MsgType.STATUS_RESPONSE,
+            sender="tester",
+            recipient=DIRECTOR,
+            payload={"status": "overflow"},
+        )
+
+
+async def test_role_addressed_director_resolves_to_runtime_identity(service):
+    """Role addressing 'director' must land in the mailbox DirectorInbox reads."""
+    from autonomous_engine.messaging.models import DIRECTOR
+
+    assert service.resolve_recipient("director") == DIRECTOR

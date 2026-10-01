@@ -38,7 +38,9 @@ class GitManager:
 
     def _run(self, args: list[str], *, cwd: Path | None = None, timeout: int = 120) -> GitResult:
         env = dict(os.environ)
-        env.setdefault("GIT_TERMINAL_PROMPT", "0")
+        # Unconditional override: setdefault kept an inherited truthy value,
+        # which can hang every git call on a credential prompt until timeout.
+        env["GIT_TERMINAL_PROMPT"] = "0"
         try:
             proc = subprocess.run(  # noqa: S603 - fixed argv, no shell
                 ["git", *args],
@@ -193,20 +195,34 @@ class GitManager:
         self._run(["worktree", "prune"])
 
     def list_worktrees(self) -> list[str]:
-        result = self._run(["worktree", "list"])
-        return [line.split()[0] for line in result.stdout.splitlines() if line.strip()]
+        # --porcelain: the human-readable output splits on whitespace, which
+        # truncated any path containing spaces (this project's own path has
+        # two). One path per "worktree <path>" line.
+        result = self._run(["worktree", "list", "--porcelain"])
+        return [
+            line[len("worktree ") :]
+            for line in result.stdout.splitlines()
+            if line.startswith("worktree ")
+        ]
 
     def merge_validated_worktree(self, task_id: str, message: str) -> str:
         """Merge a verified task worktree back into the main branch.
 
-        Git merges commits, not working directories, so the worktree's HEAD
-        commit is merged. Only ever called after the task's verification
-        passed; on conflict the merge is aborted and the worktree is left
-        intact for inspection.
+        Git merges commits, not working directories, so the coder's verified
+        working-tree changes are committed inside the worktree first — without
+        this, HEAD still points at the base commit and the merge would be a
+        no-op while remove_worktree deletes every change the task made. A
+        clean worktree (task produced no files) is tolerated. Only ever
+        called after the task's verification passed; on conflict the merge
+        is aborted and the worktree is left intact for inspection.
         """
         path = self.worktree_path(task_id)
         if not path.is_dir():
             raise GitError(f"worktree does not exist: {path}")
+        self._run(["add", "-A"], cwd=path)
+        commit = self._run(["commit", "-m", message], cwd=path)
+        if not commit.ok and "nothing to commit" not in (commit.stdout + commit.stderr):
+            raise GitError(f"cannot commit worktree changes for {task_id}: {commit.stderr}")
         head = self._run(["rev-parse", "HEAD"], cwd=path)
         if not head.ok:
             raise GitError(f"cannot resolve worktree HEAD for {task_id}: {head.stderr}")

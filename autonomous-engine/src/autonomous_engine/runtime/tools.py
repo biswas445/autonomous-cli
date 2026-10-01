@@ -47,6 +47,7 @@ MAX_SEARCH_HITS = 60
 MAX_GLOB_HITS = 200
 MAX_WEB_CHARS = 8_000
 TOOL_MAX_WRITE_BYTES = 200_000
+_MAX_FETCH_REDIRECTS = 5
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,14 @@ def _search(tools: Any, pattern: str, glob: str = "", max_hits: int = MAX_SEARCH
             break
         if not candidate.is_file() or _skip_dirs(candidate.relative_to(root)):
             continue
+        try:
+            # Repository content is untrusted input: a symlink (checked in by
+            # a task or left by an earlier command) must not lead the search
+            # outside the sandbox that read_file enforces.
+            if not candidate.resolve().is_relative_to(root.resolve()):
+                continue
+        except OSError:
+            continue
         if glob and not fnmatch.fnmatch(candidate.as_posix(), glob) and not fnmatch.fnmatch(
             candidate.name, glob
         ):
@@ -174,6 +183,9 @@ def _run_command(tools: Any, command: str, timeout: int = 120) -> str:
     return "\n".join(parts)
 
 
+_GIT_REV_OK = re.compile(r"^[A-Za-z0-9._^{}~+]+$")
+
+
 def _git_diff(tools: Any, base: str = "HEAD") -> str:
     """Read-only git diff, executed through the command allowlist."""
     if "git diff" not in " ".join(tools.permissions.allowed_command_globs) and not any(
@@ -181,7 +193,13 @@ def _git_diff(tools: Any, base: str = "HEAD") -> str:
     ):
         # fall back to the engine's own git manager when the class lacks git diff
         return "git diff is not permitted for this agent"
-    return _run_command(tools, f"git diff --unified=2 {base}")
+    revision = str(base or "HEAD").strip()
+    # `base` is model-controlled; a loose token could smuggle git flags such
+    # as --output=... or --no-index past the command allowlist (writing or
+    # reading outside the sandbox). Only plain revision tokens are accepted.
+    if revision.startswith("-") or not _GIT_REV_OK.match(revision):
+        return "git_diff: invalid base revision (use a branch, tag, sha, or HEAD~n)"
+    return _run_command(tools, f"git diff --unified=2 {revision}")
 
 
 # ---- write/edit tools (kilo `edit`, codex `apply_patch`, every coding CLI) ----
@@ -291,6 +309,14 @@ def _save_memory(tools: Any, text: str, kind: str = "fact", tags: str = "", pinn
     if kind not in KINDS:
         kind = "fact"
     tag_list = [t.strip() for t in str(tags).split(",") if t.strip()]
+    # Secret redaction covers metadata too: a credential in a tag or source
+    # would land in memory.json and MEMORY.md just the same.
+    scanned_metadata = " ".join([*tag_list, f"agent:{tools.permissions.name}"])
+    if find_secrets(scanned_metadata) or find_high_entropy_strings(scanned_metadata):
+        return (
+            "refusing to store a potential secret in memory; "
+            "remove the credential and store only the non-secret fact"
+        )
     store = memory_store(workspace)
     item = store.add(
         kind, text, source=f"agent:{tools.permissions.name}", tags=tag_list, pinned=bool(pinned)
@@ -325,27 +351,56 @@ def _web_fetch(tools: Any, url: str, max_chars: int = MAX_WEB_CHARS) -> str:
     """Fetch a URL through the network policy (SSRF-guarded, read-only)."""
     if not tools.permissions.network:
         return "network access is not permitted for this agent"
-    try:
-        validate_endpoint_url(url)
-    except EndpointNotAllowed as exc:
-        return f"blocked by network policy: {exc}"
     import httpx
 
+    # Every hop of a redirect chain must pass the endpoint policy — following
+    # redirects blindly would let a public page bounce the fetch into
+    # loopback/private/metadata space (SSRF).
+    current: str = str(url)
+    status_code = 0
+    content_type = ""
+    text = ""
     try:
-        response = httpx.get(
-            url,
-            timeout=30.0,
-            follow_redirects=True,
-            headers={"User-Agent": "autonomous-engine/0.6 (+https://github.com)"},
-        )
+        for _ in range(_MAX_FETCH_REDIRECTS):
+            validate_endpoint_url(current)
+            with httpx.stream(
+                "GET",
+                current,
+                timeout=30.0,
+                follow_redirects=False,
+                headers={"User-Agent": "autonomous-engine/0.6 (+https://github.com)"},
+            ) as response:
+                if response.is_redirect:
+                    location = response.headers.get("location", "")
+                    if not location:
+                        return "fetch failed: redirect without a location header"
+                    current = str(httpx.URL(response.url).join(location))
+                    continue
+                status_code = response.status_code
+                content_type = response.headers.get("content-type", "")
+                # Stream and cap the read: buffering an unbounded body would
+                # let a huge URL exhaust the runtime's memory.
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in response.iter_bytes():
+                    chunks.append(chunk)
+                    total += len(chunk)
+                    if total >= MAX_TOOL_CHARS:
+                        break
+                text = b"".join(chunks).decode(
+                    response.charset_encoding or "utf-8", errors="replace"
+                )
+                break
+        else:
+            return "blocked by network policy: too many redirects"
+    except EndpointNotAllowed as exc:
+        return f"blocked by network policy: {exc}"
     except httpx.HTTPError as exc:
         return f"fetch failed: {exc}"
-    content_type = response.headers.get("content-type", "")
-    body = response.text
     if "html" in content_type:
-        body = _strip_html(body)
-    body = body[: max(200, min(int(max_chars or MAX_WEB_CHARS), MAX_TOOL_CHARS))]
-    return f"status: {response.status_code} | content-type: {content_type}\n\n{body}"
+        text = _strip_html(text)
+    body = text[: max(200, min(int(max_chars or MAX_WEB_CHARS), MAX_TOOL_CHARS))]
+    return f"status: {status_code} | content-type: {content_type}\n\n{body}"
 
 
 _DDG_RESULT = re.compile(

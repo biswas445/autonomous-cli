@@ -100,6 +100,52 @@ async def test_unknown_escalations_block_then_resolve(project: Path):
     context.db.close()
 
 
+async def test_cli_approve_requeues_architecture_review_task(project: Path):
+    """Regression: `auto approve <id>` then `auto run` must resume the task.
+
+    The control-signal approval path used to only lift risk gates; the task
+    stayed in ARCHITECTURE_REVIEW and the next run stopped with
+    REPEATED_FAILURE at cycle 1 without doing any work.
+    """
+    from autonomous_engine.core.state_machine import TaskState
+    from autonomous_engine.core.task import Task
+    from autonomous_engine.runtime.control import ControlChannel
+    from autonomous_engine.runtime.stop import StopReason
+
+    context = open_context(project)
+    graph = context.workspace.load_graph()
+    task = Task(id="TASK-CLI-1", title="gated work", status=TaskState.ARCHITECTURE_REVIEW)
+    task.attempts = 3
+    graph.add_task(task)
+    context.workspace.save_graph(graph)
+    context.workspace.add_escalation(
+        {
+            "id": "ESC-CLI-1",
+            "task_id": "TASK-CLI-1",
+            "kind": "repeated_failure",
+            "reason": "attempts exhausted",
+            "status": "pending",
+            "created_at": "now",
+        }
+    )
+
+    orchestrator = Orchestrator(context, use_model_director=False)
+    result = await _run(orchestrator, "Build the gated target")
+    assert result.stop.reason == StopReason.HUMAN_APPROVAL_REQUIRED
+
+    # Operator: `auto approve ESC-CLI-1` = resolve the escalation + write the
+    # control signal (exactly what cli/app._resolve_escalation does).
+    context.workspace.resolve_escalation("ESC-CLI-1", "approved", "operator approved")
+    ControlChannel(context.workspace.paths.execution).request(approvals=["ESC-CLI-1"])
+
+    orchestrator2 = Orchestrator(context, use_model_director=False)
+    result2 = await _run(orchestrator2, "Build the gated target")
+    assert result2.stop.reason != StopReason.REPEATED_FAILURE, result2.stop.describe()
+    graph2 = context.workspace.load_graph()
+    assert graph2.get("TASK-CLI-1").status == TaskState.COMPLETED
+    context.db.close()
+
+
 async def test_duplicate_checkpoint_ids_are_not_produced(project: Path):
     """Idempotency: each checkpoint gets a fresh, monotonic id (plan.md §20)."""
     context = open_context(project)

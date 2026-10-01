@@ -165,8 +165,8 @@ async def test_state_store_polls_incrementally(ran_project: Path):
         state.load_recent(100)
         initial = len(state.activity)
         assert initial > 0
-        # A no-op poll adds nothing (no new events).
-        assert state.poll_events() == 0
+        # A no-op poll adds nothing (re-read same-second events are deduped).
+        assert state.poll_events() == []
         # Filtering narrows the visible feed.
         state.filter_text = "verification"
         assert len(state.visible_activity()) <= initial

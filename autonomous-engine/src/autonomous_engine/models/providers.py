@@ -351,8 +351,7 @@ class AnthropicProvider(ProviderAdapter):
                 provider=self.name,
                 model=model,
             )
-        messages: list[dict[str, Any]] = [_anthropic_message(m) for m in request.messages]
-        messages.append({"role": "user", "content": request.prompt})
+        messages = _anthropic_conversation(request.messages, request.prompt)
         body: dict[str, Any] = {
             "model": model,
             "max_tokens": request.max_tokens,
@@ -531,6 +530,35 @@ def _anthropic_message(message: ChatMessage) -> dict[str, Any]:
         )
         return {"role": "assistant", "content": blocks}
     return {"role": message.role, "content": message.content}
+
+
+def _anthropic_conversation(history: list[ChatMessage], prompt: str) -> list[dict[str, Any]]:
+    """Build a role-alternating Anthropic message list.
+
+    The Anthropic API rejects consecutive same-role messages, so: consecutive
+    tool results are merged into one user turn, and the caller's prompt
+    becomes the FIRST user turn (appending it at the end produced
+    user-after-user and a 400 on every tool-loop iteration after the first).
+    """
+    converted = [_anthropic_message(m) for m in history]
+    merged: list[dict[str, Any]] = []
+    for message in converted:
+        if merged and message["role"] == "user" and merged[-1]["role"] == "user":
+            previous = merged[-1]["content"]
+            blocks = previous if isinstance(previous, list) else [{"type": "text", "text": previous}]
+            blocks.extend(message["content"])
+            merged[-1]["content"] = blocks
+        else:
+            merged.append(message)
+    prompt_message: dict[str, Any] = {"role": "user", "content": prompt}
+    if merged and merged[0]["role"] == "user":
+        first = merged[0]["content"]
+        merged[0]["content"] = [{"type": "text", "text": prompt}] + (
+            first if isinstance(first, list) else [{"type": "text", "text": first}]
+        )
+    else:
+        merged.insert(0, prompt_message)
+    return merged
 
 
 def _parse_anthropic_tool_uses(blocks: list[dict[str, Any]]) -> list[ToolCall]:

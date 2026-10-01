@@ -192,6 +192,33 @@ def test_anthropic_provider_requires_api_key(monkeypatch):
         asyncio.run(provider.complete(_request(), "claude-x"))
 
 
+def test_anthropic_conversation_alternates_roles():
+    """Regression: appending the prompt after tool results produced consecutive
+    user turns, which the Anthropic API rejects with a 400."""
+    from autonomous_engine.models.base import ChatMessage
+    from autonomous_engine.models.providers import _anthropic_conversation
+
+    history = [
+        ChatMessage(role="assistant", content="working", tool_calls=[]),
+        ChatMessage(role="tool", content="result one", tool_call_id="t1", name="search"),
+        ChatMessage(role="tool", content="result two", tool_call_id="t2", name="read_file"),
+    ]
+    messages = _anthropic_conversation(history, "original task")
+    roles = [m["role"] for m in messages]
+    assert roles == ["user", "assistant", "user"]
+    # the prompt is the first user turn
+    assert messages[0]["content"] == "original task"
+    # consecutive tool results merged into one user turn with two blocks
+    assert [b["type"] for b in messages[2]["content"]] == ["tool_result", "tool_result"]
+
+
+def test_anthropic_conversation_first_call_places_prompt_only():
+    from autonomous_engine.models.providers import _anthropic_conversation
+
+    messages = _anthropic_conversation([], "the task")
+    assert messages == [{"role": "user", "content": "the task"}]
+
+
 def test_unknown_provider_lookup():
     with pytest.raises(ModelError):
         get_provider("definitely-not-registered")

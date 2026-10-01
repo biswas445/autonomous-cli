@@ -131,6 +131,16 @@ def test_microagents_readme_is_never_loaded(project):
         ("git status --porcelain", CommandRisk.LOW),
         ("npm test", CommandRisk.LOW),
         ("frobnicate --now", CommandRisk.UNKNOWN),
+        # regression: split/long flags and Windows builtins were unrated
+        ("rm -f -r build", CommandRisk.HIGH),
+        ("rm --recursive --force build", CommandRisk.HIGH),
+        ("rm -Rf build", CommandRisk.HIGH),
+        ("rm --recursive build", CommandRisk.MEDIUM),
+        ("rd /s /q C:\\temp", CommandRisk.HIGH),
+        ("rmdir /s build", CommandRisk.HIGH),
+        ("del /f /s /q *.*", CommandRisk.HIGH),
+        ("Remove-Item build -Recurse -Force", CommandRisk.HIGH),
+        ("del build/temp.log", CommandRisk.UNKNOWN),
     ],
 )
 def test_command_risk_classification(command, expected):
@@ -280,6 +290,22 @@ def test_high_entropy_secret_detected_without_revealing_value():
 )
 def test_high_entropy_false_positives_avoided(text):
     assert find_high_entropy_strings(text) == []
+
+
+def test_url_with_embedded_credential_is_flagged():
+    """Regression: the https?:// allowlist matched anywhere in the literal and
+    disabled the scan for URLs that carry a key/token query parameter."""
+    leaked = 'base = "https://cfg.internal/v1?key=WhNv3xP9qZ7mK2rT8sL4bY6u"'
+    assert find_high_entropy_strings(leaked), "credential-in-URL must be flagged"
+    # a plain URL with no credential params stays allowlisted
+    assert find_high_entropy_strings('url = "https://example.com/some/long/path/here"') == []
+
+
+def test_unquoted_credential_assignment_is_flagged():
+    """Regression: only quoted literals were scanned, so `key = WhNv...`
+    sailed through."""
+    leaked = "apikey = WhNv3xP9qZ7mK2rT8sL4bY6uQ1wE5"
+    assert find_high_entropy_strings(leaked), "unquoted credential must be flagged"
 
 
 def test_security_agent_reports_entropy_findings(tmp_path):
