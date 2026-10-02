@@ -108,7 +108,13 @@ def _read_file(tools: Any, path: str, start_line: int = 1, end_line: int = 0) ->
 
 
 def _list_dir(tools: Any, path: str = ".") -> str:
-    entries = tools.list_dir(path)
+    # Models call list_dir with file paths too ("what's in this file's
+    # directory?") — resolve that instead of failing the call (live test
+    # root cause: a plain NotADirectoryError wasted an agent iteration).
+    resolved = tools._resolve(str(path))
+    if resolved.is_file():
+        path = resolved.parent.name or "."
+    entries = tools.list_dir(str(path))
     return "\n".join(entries) if entries else "(empty directory)"
 
 

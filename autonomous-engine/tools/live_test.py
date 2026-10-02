@@ -20,16 +20,16 @@ from autonomous_engine.runtime.context_setup import open_context
 from autonomous_engine.runtime.bootstrap import init_project
 from autonomous_engine.runtime.orchestrator import Orchestrator
 
-ROOT = Path(__file__).resolve().parent.parent / "live-test" / "run1"
+ROOT = Path(__file__).resolve().parent.parent / "live-test" / "run2"
 BUDGET_USD = 5.0
-MAX_SECONDS = 600.0  # 10 minutes
+MAX_SECONDS = 1500.0  # 25 minutes: real providers take 30-90s per call
 MONITOR_INTERVAL = 15.0
 
 
 def setup_project() -> None:
     if ROOT.exists():
         return
-    init_project(ROOT, project_name="live-run1", objective="Build a small notes REST API")
+    init_project(ROOT, project_name="live-run2", objective="Build a small notes REST API")
     config_path = ROOT / ".agents" / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
     # Real routes: atria for reasoning-heavy roles, kios for the coding/test
