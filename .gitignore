@@ -1,0 +1,4 @@
+
+# runtime/monitoring state (never commit)
+.mimosa/
+.freebuff/
