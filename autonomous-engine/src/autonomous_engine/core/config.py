@@ -93,6 +93,12 @@ DEFAULT_PERMISSION_CLASSES: dict[str, PermissionClass] = {
         allowed_command_globs=[
             "pytest*",
             "python*",
+            # `test`/`ls`-style file-existence probes the DoD engine and real
+            # models emit constantly (live test: `test -f app/store.py` was
+            # rejected, failing verification on a healthy implementation).
+            "test*",
+            "ls*",
+            "dir*",
             "node*",
             "npm*",
             "npx*",

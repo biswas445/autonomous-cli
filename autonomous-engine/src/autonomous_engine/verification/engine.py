@@ -104,9 +104,10 @@ class DefinitionOfDone:
     # failed verification on a PermissionError. Explicit `run:` prefixes are
     # the escape hatch for anything else.
     _RUNNERS = {
-        "bash", "bun", "cargo", "deno", "dotnet", "go", "gradle", "java", "make",
-        "mypy", "mvn", "node", "npm", "npx", "pip", "pnpm", "poetry", "py",
-        "python", "python3", "pytest", "ruff", "sh", "tox", "tsc", "uv", "yarn",
+        "bash", "bun", "cargo", "cmd", "deno", "dotnet", "go", "gradle", "java",
+        "ls", "make", "mypy", "mvn", "node", "npm", "npx", "pip", "pnpm",
+        "poetry", "py", "python", "python3", "pytest", "ruff", "sh", "test",
+        "tox", "tsc", "uv", "yarn",
     }
 
     def __init__(self, criteria: list[str]):

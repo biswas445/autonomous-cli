@@ -101,7 +101,9 @@ async def main() -> int:
                 f"active {progress.get('active', 0)} | cost ${budget.get('cost_usd', 0):.4f} | "
                 f"locks {len(orchestrator.locks.snapshot())}"
             )
-        result = await asyncio.wait_for(run_task, timeout=120)
+        # Real model calls through 5-RPM kios take 30-90s each; a run in
+        # flight may legitimately need several minutes to wind down.
+        result = await asyncio.wait_for(run_task, timeout=600)
         print(f"[live] run finished: status={result.status} stop={result.stop.reason.value if result.stop else '?'}")
         return 0
     except Exception as exc:
