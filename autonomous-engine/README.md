@@ -27,20 +27,32 @@ logoffs and reboots — see `docs/DAEMON.md`.
 ## Quick start
 
 ```bash
-pip install -e ".[dev]"
+pip install -e ".[dev]" pre-commit
+pre-commit install        # ruff + secret-scan on every commit
 
 # 1. Create a project (offline, deterministic — no model call)
 auto init --objective "Build a small REST API for managing notes"
 
-# 2. (Optional) point agents at a real model
-#    Edit .agents/config.json -> model_routes, set provider/model + env vars:
-#    OPENAI_API_KEY / ANTHROPIC_API_KEY
+# 2. Point agents at a real model (choose ONE of the two):
+#    a) standard env vars:
+export OPENAI_API_KEY=sk-...          # or ANTHROPIC_API_KEY
+#    b) a .env file at the project root or above, grouped per provider:
+#       baseurl = https://your-provider.com/v1
+#       apikey  = sk-...
+#       models  = your-model-id
+#       (blocks are blank-line separated; each becomes a named provider the
+#       routes can reference — see docs/CONFIGURATION.md)
 
 # 3. Run autonomously until completion criteria are met
 auto run
 
 # ... or fully offline first: the echo provider exercises the whole loop
 auto run --provider echo --no-director
+
+# Long-running mode (days/months): daemon under a crash-restarting supervisor
+auto daemon                            # in-terminal long-running mode
+auto supervise                         # supervisor restarts the daemon on crash
+auto supervisor install                # register with the OS (survives reboot)
 
 # Supervised mode: high-risk tasks require explicit approval
 auto run --supervised
@@ -78,6 +90,10 @@ auto reset --hard --yes              Destroy project state (keeps repository)
 auto supervise                       Daemon under a crash-restarting supervisor
 auto supervisor install|status|uninstall
                                      OS registration (Task Scheduler/systemd/launchd)
+auto verify task <id>|history <id>|stale|policy
+                                     Verification evidence + quality-gate inspection
+auto runtime start|status|stop|attach
+                                     Persistent runtime daemon over local IPC
 ```
 
 ## What the runtime owns vs. what models own

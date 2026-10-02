@@ -384,7 +384,7 @@ class RuntimeClient:
         client.on_event = self._dispatch_event
         try:
             if endpoint.transport == "named_pipe":
-                client.connect_pipe(endpoint.address)
+                client.connect_pipe(endpoint.connect_address)
             else:
                 host, _, port = endpoint.address.partition(":")
                 client.connect_tcp(host, int(port))

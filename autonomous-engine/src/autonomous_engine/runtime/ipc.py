@@ -331,8 +331,18 @@ class WindowsPipeTransportServer:
 def create_server(slug: str, prefer: str = "auto") -> tuple[Any, str]:
     """Create the best available transport server; returns (server, transport)."""
     if os.name == "nt" and prefer in ("auto", "named_pipe"):
-        return WindowsPipeTransportServer(pipe_name(slug)), "named_pipe"
+        # pipe_name() already returns the full Win32 path; the server takes
+        # the path as-is (wrapping it again doubled the prefix and broke
+        # every connection).
+        return WindowsPipeTransportServer(_strip_pipe_prefix(pipe_name(slug))), "named_pipe"
     return TcpTransportServer(), "tcp"
+
+
+def _strip_pipe_prefix(path: str) -> str:
+    prefix = "\\\\.\\pipe\\"
+    while path.startswith(prefix):
+        path = path[len(prefix):]
+    return path
 
 
 # ---- client -------------------------------------------------------------------
@@ -555,3 +565,20 @@ class RuntimeEndpoint:
             heartbeat_at=str(doc.get("heartbeat_at", "")),
             protocol=int(doc.get("protocol", 0) or 0),
         )
+
+    @property
+    def connect_address(self) -> str:
+        """The address a client passes to connect_pipe/connect_tcp.
+
+        Older endpoint docs stored the full Win32 pipe path; pipe_name()
+        now returns the full path itself, so strip a doubled
+        `\\\\.\\pipe\\` prefix that older docs (or a double-wrapped name)
+        would produce.
+        """
+        if self.transport == "named_pipe":
+            prefix = "\\\\.\\pipe\\"
+            if self.address.startswith(prefix * 2):
+                return self.address[len(prefix):]
+            if not self.address.startswith(prefix):
+                return prefix + self.address
+        return self.address

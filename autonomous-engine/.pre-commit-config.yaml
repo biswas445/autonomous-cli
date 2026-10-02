@@ -10,7 +10,8 @@ repos:
     hooks:
       - id: secret-scan
         name: secret-scan (gitleaks-style, dogfooded)
-        entry: python tools/secret_scan.py
+        # hook runs from the repo root; resolve relative to this config file
+        entry: python autonomous-engine/tools/secret_scan.py
         language: system
         types: [text]
         exclude: '\.(png|jpg|jpeg|gif|ico|pdf|zip|sqlite)$|\.env\.example$'
