@@ -150,6 +150,58 @@ class ToolLoop:
                     # not the model also tried to call tools: the loop ran out
                     # of room, and downstream evidence should know it.
                     result.stopped_reason = "max_iterations"
+                # Live test finding: a schema_hinted agent whose final answer
+                # is prose (no JSON object) fails extract_json downstream and
+                # wastes the whole loop. One schema-forced retry turns the
+                # prose answer into the expected JSON.
+                if schema_hint and result.stopped_reason != "error":
+                    from ..models.router import extract_json
+
+                    try:
+                        extract_json(result.text)
+                    except ModelError:
+                        retry_request = CompletionRequest(
+                            system=system,
+                            prompt=(
+                                f"{prompt}\n\nYour previous answer was not valid JSON. "
+                                "Convert it to a single valid JSON object now, with "
+                                "no prose, no code fences. Original instructions:\n"
+                                + (f"Schema: {schema_hint}" if schema_hint else "")
+                            ),
+                            schema_hint=schema_hint,
+                            max_tokens=max_tokens,
+                            temperature=temperature,
+                            tools=[],
+                            messages=list(messages),
+                        )
+                        try:
+                            self._emit("model.call", role=role, iteration=iteration, retry=True)
+                            retry_response = await self.router.complete(
+                                retry_request,
+                                role,
+                                complexity=complexity,
+                                security_sensitivity=security_sensitivity,
+                            )
+                            from ..models.router import extract_json as _extract
+
+                            _extract(retry_response.text)  # only adopt valid JSON
+                            result.tokens_in += retry_response.usage.tokens_in
+                            result.tokens_out += retry_response.usage.tokens_out
+                            result.cost_usd += retry_response.usage.cost_usd
+                            result.text = retry_response.text
+                            self._emit(
+                                "model.response",
+                                role=role,
+                                iteration=iteration,
+                                retry=True,
+                                chars=len(retry_response.text),
+                                tokens_in=retry_response.usage.tokens_in,
+                                tokens_out=retry_response.usage.tokens_out,
+                                cost_usd=retry_response.usage.cost_usd,
+                                preview=retry_response.text[:400],
+                            )
+                        except ModelError:
+                            pass  # keep the prose answer; the caller fails honestly
                 return result
 
             messages.append(

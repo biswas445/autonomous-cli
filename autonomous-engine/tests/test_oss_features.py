@@ -382,3 +382,51 @@ async def test_tool_calls_emit_live_observability_events(project, echo):
     observation = [e for e in context.workspace.events.read_all() if e["event"] == "tool.observation"][0]
     assert observation["ok"] is True
     context.db.close()
+
+
+async def test_schema_hinted_prose_answer_gets_json_retry(project):
+    """Live test: a schema_hinted agent whose final tool-loop answer is prose
+    failed extract_json downstream, wasting the whole loop. The loop now
+    retries once with a schema-forced prompt and adopts only valid JSON."""
+    from autonomous_engine.models.base import ModelResponse, Usage
+    from autonomous_engine.runtime.context_setup import open_context
+    from autonomous_engine.runtime.orchestrator import Orchestrator
+    from autonomous_engine.runtime.tool_loop import ToolLoop
+
+    class ProseThenJsonRouter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, request, role, **kwargs) -> ModelResponse:
+            self.calls += 1
+            # every call answers prose first (the model ignoring JSON),
+            # except when the retry prompt arrives
+            if "not valid JSON" in request.prompt:
+                return ModelResponse(
+                    text='{"edits": []}',
+                    usage=Usage(tokens_in=50, tokens_out=10, cost_usd=0.0),
+                    latency_ms=1.0,
+                )
+            return ModelResponse(
+                text="I looked at the repository and it seems fine.",
+                usage=Usage(tokens_in=50, tokens_out=10, cost_usd=0.0),
+                latency_ms=1.0,
+            )
+
+    context = open_context(project)
+    orchestrator = Orchestrator(context, use_model_director=False)
+    router = ProseThenJsonRouter()
+    loop = ToolLoop(router, max_iterations=2, on_event=orchestrator.emit)
+    result = await loop.run(
+        role="coder",
+        system="system prompt",
+        prompt="implement the thing",
+        tools=orchestrator.orchestrator_tools,
+        tool_names=(),
+        schema_hint="JSON with edits[]",
+    )
+    assert router.calls == 2, "one schema-forced retry must happen"
+    assert '"edits"' in result.text, "the valid JSON retry must be adopted"
+    retry_events = [e for e in context.workspace.events.read_all() if e.get("retry")]
+    assert retry_events, "the retry must be observable"
+    context.db.close()
