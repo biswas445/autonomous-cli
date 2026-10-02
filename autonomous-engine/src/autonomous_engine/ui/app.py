@@ -379,7 +379,7 @@ class DetailPanel(Static):
         self.set_text("\n".join(lines))
 
     def render_agent_comm(self, facade: RuntimeFacade) -> None:
-        """Per-agent communication stats (comms spec §59)."""
+        """Per-agent communication stats + who-talked-to-whom graph (§59, §74)."""
         stats = facade.agent_comm_stats()
         if not stats:
             self.set_text("[bold reverse] AGENT TRAFFIC [/bold reverse]\n\n[dim]no messages yet[/dim]")
@@ -391,6 +391,14 @@ class DetailPanel(Static):
                 f"[yellow]pending {s['pending']}[/yellow] · "
                 + (f"[red]failed {s['failed']}[/red]" if s["failed"] else "failed 0")
             )
+        graph = facade.communication_graph()
+        if graph:
+            lines += ["", "[bold]communication graph[/bold]"]
+            for edge in graph:
+                failed = f" [red]({edge['failed']} lost)[/red]" if edge["failed"] else ""
+                lines.append(
+                    f"  {edge['sender'][:16]} → {edge['recipient'][:16]}  {edge['messages']}{failed}"
+                )
         self.set_text("\n".join(lines))
 
 
@@ -479,11 +487,19 @@ class EngineTUI(App):
         Binding("q", "quit", "quit"),
     ]
 
-    def __init__(self, root: Path, *, attached: bool = True, objective: str = ""):
+    def __init__(
+        self, root: Path, *, attached: bool = True, objective: str = "", process_fallback: bool = False
+    ):
         super().__init__()
         self.facade = RuntimeFacade(root)
         self.state = UIState(facade=self.facade)
-        self.runner = UIRunner(self.facade, self.state, attached=attached)
+        # Directive #2: the TUI is a pure client. With a live runtime daemon
+        # it attaches over IPC; without one it only observes persisted state
+        # unless the operator explicitly asked for the in-process fallback.
+        self.runner = UIRunner(
+            self.facade, self.state, attached=attached, allow_process_fallback=process_fallback
+        )
+        self.runner.ensure_connection()
         self._initial_objective = objective
         self._detail_mode = "overview"
         self._detail_task_id = ""
@@ -521,16 +537,28 @@ class EngineTUI(App):
         self.set_interval(REFRESH_SECONDS, self.on_tick)
 
     async def on_tick(self) -> None:
-        fresh = self.state.poll_events()
-        if fresh:
-            feed = self.query_one(ActivityFeed)
-            # Emit exactly the new items, applying the filter per item —
-            # re-slicing visible_activity() replayed old lines whenever a
-            # non-matching event arrived while a filter was active.
-            for item in fresh:
-                if item.matches(self.state.filter_text):
-                    feed.emit_item(item)
+        # IPC mode: events are PUSHED by the daemon into state.ingest; the
+        # poll below stays for observe/process modes and for replay catch-up.
+        if self.runner.mode != "ipc":
+            fresh = self.state.poll_events()
+            self._emit_fresh(fresh)
+        elif not self.runner.connected:
+            self.runner.schedule_reconnect()
+        else:
+            # Periodic catch-up in case a push was dropped between ticks.
+            self.runner._replay_since_last()
         self.refresh_all()
+
+    def _emit_fresh(self, fresh) -> None:
+        if not fresh:
+            return
+        feed = self.query_one(ActivityFeed)
+        # Emit exactly the new items, applying the filter per item —
+        # re-slicing visible_activity() replayed old lines whenever a
+        # non-matching event arrived while a filter was active.
+        for item in fresh:
+            if item.matches(self.state.filter_text):
+                feed.emit_item(item)
 
     # ---- rendering ----
 
@@ -569,12 +597,17 @@ class EngineTUI(App):
         budget_text = f"{budget:.0f}% left" if budget is not None else "n/a"
         agents = len(self.facade.active_agents())
         mode = "ENHANCE ON" if self.facade.enhance_prompt_enabled() else "ENHANCE OFF"
+        connection = {
+            "ipc": "IPC",
+            "process": "OWN",
+            "observe": "OBSERVE",
+        }.get(self.runner.mode, self.runner.mode.upper())
         self.sub_title = (
             f"{self.facade.project().get('name', 'project')} · "
             f"tasks {progress['completed']}/{progress['total']} · "
             f"agents {agents} · {status} · "
             f"runtime {_fmt_elapsed(self.state.elapsed_seconds())} · "
-            f"budget {budget_text} · {mode}"
+            f"budget {budget_text} · {mode} · {connection}"
         )
 
     def _push(self, message: str, kind: str = "info") -> None:
@@ -843,7 +876,9 @@ class EngineTUI(App):
         self.exit()
 
 
-def launch(root: Path, *, attached: bool = True, objective: str = "") -> None:
+def launch(
+    root: Path, *, attached: bool = True, objective: str = "", process_fallback: bool = False
+) -> None:
     """Entry point used by the CLI. Falls back to plain mode without a TTY."""
     import sys
 
@@ -852,4 +887,6 @@ def launch(root: Path, *, attached: bool = True, objective: str = "") -> None:
 
         run_plain(root, objective=objective)
         return
-    EngineTUI(root, attached=attached, objective=objective).run()
+    EngineTUI(
+        root, attached=attached, objective=objective, process_fallback=process_fallback
+    ).run()

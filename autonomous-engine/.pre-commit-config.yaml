@@ -1,0 +1,22 @@
+# Pre-commit safety net (directive #9): lint + credential scanning.
+# Install once per clone:  pip install -e ".[dev]" && pre-commit install
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.8.4
+    hooks:
+      - id: ruff
+        args: [--fix]
+  - repo: local
+    hooks:
+      - id: secret-scan
+        name: secret-scan (gitleaks-style, dogfooded)
+        entry: python tools/secret_scan.py
+        language: system
+        types: [text]
+        exclude: '\.(png|jpg|jpeg|gif|ico|pdf|zip|sqlite)$|\.env\.example$'
+      - id: no-apikeys-file
+        name: never commit apikeys.txt
+        entry: python -c "import sys; sys.exit('apikeys.txt must never be committed') if any('apikeys' in a for a in sys.argv[1:]) else 0"
+        language: system
+        pass_filenames: true
+        always_run: true

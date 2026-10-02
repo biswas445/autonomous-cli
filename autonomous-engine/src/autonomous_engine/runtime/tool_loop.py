@@ -69,9 +69,20 @@ def neutral_tool_schemas(names: tuple[str, ...] | list[str]) -> list[NeutralTool
 class ToolLoop:
     """Runs one bounded tool-calling conversation for an agent."""
 
-    def __init__(self, router: Any, *, max_iterations: int = 6):
+    def __init__(self, router: Any, *, max_iterations: int = 6, on_event: Any = None):
         self.router = router
         self.max_iterations = max(1, max_iterations)
+        # Optional live-activity sink (agent._activity): real tool traffic as
+        # it happens, for the TUI/IPC observers. Never breaks the loop.
+        self.on_event = on_event
+
+    def _emit(self, event: str, **fields: Any) -> None:
+        if self.on_event is None:
+            return
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            self.on_event(event, **fields)
 
     async def run(
         self,
@@ -104,6 +115,7 @@ class ToolLoop:
                 messages=list(messages),
             )
             try:
+                self._emit("model.call", role=role, iteration=iteration)
                 response = await self.router.complete(
                     request,
                     role,
@@ -118,6 +130,16 @@ class ToolLoop:
             result.tokens_in += response.usage.tokens_in
             result.tokens_out += response.usage.tokens_out
             result.cost_usd += response.usage.cost_usd
+            self._emit(
+                "model.response",
+                role=role,
+                iteration=iteration,
+                chars=len(response.text),
+                tokens_in=response.usage.tokens_in,
+                tokens_out=response.usage.tokens_out,
+                cost_usd=response.usage.cost_usd,
+                preview=response.text[:400],
+            )
 
             if not response.tool_calls or final_iteration:
                 # No tools requested (offline echo, or the model answered) —
@@ -138,9 +160,27 @@ class ToolLoop:
                 )
             )
             for call in response.tool_calls:
+                self._emit(
+                    "tool.call",
+                    role=role,
+                    iteration=iteration,
+                    tool=call.name,
+                    arguments={
+                        k: str(v)[:80] for k, v in (call.arguments or {}).items()
+                    },
+                )
                 observation = execute_tool(tools, call.name, call.arguments)
                 result.tool_calls += 1
-                result.transcript.append(_transcript_entry(call, observation))
+                entry = _transcript_entry(call, observation)
+                result.transcript.append(entry)
+                self._emit(
+                    "tool.observation",
+                    role=role,
+                    tool=call.name,
+                    chars=entry["chars"],
+                    ok=entry["ok"],
+                    preview=entry["preview"],
+                )
                 # Tool output is untrusted data (v2 §104): a repository file
                 # may contain text that looks like instructions. The marker
                 # lets the model separate observed content from policy.

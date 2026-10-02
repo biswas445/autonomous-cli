@@ -63,6 +63,9 @@ class AgentDeps:
     workspace: Any  # Workspace (typed loosely to avoid an import cycle)
     store: Any  # Store
     git: Any  # GitManager
+    # Live activity sink (set by the orchestrator to its `emit`): real-time
+    # model/tool observability for the TUI and IPC clients (§17, §60).
+    on_activity: Any = None
 
 
 class Agent(abc.ABC):
@@ -82,6 +85,14 @@ class Agent(abc.ABC):
     def bind_tools(self, tools: ToolBox) -> None:
         """Attach the sandbox for this agent's permission class."""
         self._tools = tools
+
+    def _activity(self, event: str, **fields: Any) -> None:
+        """Emit a live activity event; observability must never break a run."""
+        sink = self.deps.on_activity
+        if sink is None:
+            return
+        with contextlib.suppress(Exception):
+            sink(event, agent=self.name, **fields)
 
     @property
     def tools(self) -> ToolBox:
@@ -115,6 +126,7 @@ class Agent(abc.ABC):
             max_tokens=max_tokens,
             temperature=temperature,
         )
+        self._activity("model.call", role=self.role, schema=bool(schema_hint))
         response = await self.deps.router.complete(
             request,
             self.role,
@@ -124,6 +136,18 @@ class Agent(abc.ABC):
         from ..models.router import extract_json
 
         payload = extract_json(response.text)
+        # Real model output, streamed to observers at completion (chunk-level
+        # streaming is a provider concern; this is the honest event boundary).
+        self._activity(
+            "model.response",
+            role=self.role,
+            chars=len(response.text),
+            tokens_in=response.usage.tokens_in,
+            tokens_out=response.usage.tokens_out,
+            cost_usd=response.usage.cost_usd,
+            latency_ms=round(response.latency_ms, 1),
+            preview=response.text[:400],
+        )
         return payload, {
             "cost_usd": response.usage.cost_usd,
             "tokens_in": response.usage.tokens_in,
@@ -154,7 +178,7 @@ class Agent(abc.ABC):
         from ..models.router import extract_json
         from .tool_loop import ToolLoop
 
-        loop = ToolLoop(self.deps.router, max_iterations=max_iterations)
+        loop = ToolLoop(self.deps.router, max_iterations=max_iterations, on_event=self._activity)
         result = await loop.run(
             role=self.role,
             system=system,

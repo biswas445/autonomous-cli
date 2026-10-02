@@ -21,6 +21,7 @@ overrides the constitution, permissions, or the operator's constraints.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -66,6 +67,9 @@ class AgentContext:
     dropped_sections: list[str] = field(default_factory=list)
     project_rules: str = ""
     char_budget: int = 24_000
+    # Per-section provenance/trust metadata (context spec §11, §14): set by
+    # the builder, persisted in session snapshots, never alters the prompt.
+    provenance: dict[str, Any] = field(default_factory=dict)
 
     def render(self) -> str:
         parts: list[str] = [DATA_BOUNDARY_RULE]
@@ -139,6 +143,22 @@ class ContextBuilder:
         self.char_budget = char_budget
         self.max_repo_files = max_repo_files
         self.max_events = max_events
+        from .context_engineering import SessionSnapshotStore
+
+        self.snapshots = SessionSnapshotStore(workspace.paths.state)
+
+    def char_budget_for(self, role: str) -> int:
+        """Per-model budget (context spec §16): the routed model's context
+        limit sets the input budget; unknown models keep the safe default."""
+        try:
+            from ..models.capabilities import REGISTRY
+            from .context_engineering import budget_for_model
+
+            route = self.workspace.load_config().route_for(role)
+            profile = REGISTRY.profile(route.provider, route.model)
+            return budget_for_model(profile.context_limit if profile else None)
+        except Exception:
+            return self.char_budget
 
     def build(
         self,
@@ -151,7 +171,7 @@ class ContextBuilder:
     ) -> AgentContext:
         project = self.workspace.load_project()
         ctx = AgentContext(goal=project.get("objective", "") or project.get("name", ""))
-        ctx.char_budget = self.char_budget
+        ctx.char_budget = self.char_budget_for(role)
 
         candidates: list[tuple[str, str]] = []
         candidates.append(("instructions", instructions_context_section(self.workspace)))
@@ -177,16 +197,41 @@ class ContextBuilder:
             candidates.append((name, body))
 
         used = len(ctx.goal) + (len(ctx.render()) if task else 0)
+        from .context_engineering import compact_history
+
         for name, body in candidates:
             if not body:
                 continue
             cost = len(body) + 2
             if used + cost > ctx.char_budget:
+                # Loss-aware compaction instead of wholesale dropping (spec
+                # §20): durable lines (decisions, failures, milestones)
+                # survive; routine noise is summarized away.
+                if name == "recent_events":
+                    compacted = compact_history(
+                        body, max(500, ctx.char_budget - used - 100)
+                    )
+                    if compacted.kept_lines and (
+                        used + len(compacted.text) + 2 <= ctx.char_budget
+                    ):
+                        ctx.sections[name] = compacted.text + "\n" + compacted.note()
+                        used += len(compacted.text) + 2
+                        continue
                 ctx.dropped_sections.append(name)
                 continue
             ctx.sections[name] = body
             used += cost
 
+        from .context_engineering import attach_provenance
+
+        ctx.provenance = attach_provenance(ctx)
+        try:
+            model = ""
+            with contextlib.suppress(Exception):
+                model = self.workspace.load_config().route_for(role).model
+            self.snapshots.save(ctx, role=role, model=model)
+        except Exception:
+            pass  # snapshots are observability, never load-bearing
         ctx.project_rules = self._rules_section(role)
         return ctx
 

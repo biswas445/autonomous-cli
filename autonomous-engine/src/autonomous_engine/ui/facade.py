@@ -341,6 +341,25 @@ class RuntimeFacade:
             for name, counts in sorted(stats.items(), key=lambda kv: -(kv[1]["sent"] + kv[1]["received"]))
         ]
 
+    def communication_graph(self, *, limit: int = 14) -> list[dict[str, Any]]:
+        """Who talked to whom, as directed edges with counts (§73/§74)."""
+        store = self._message_store()
+        rows = store.list_messages(limit=1000)
+        edges: dict[tuple[str, str], dict[str, int]] = {}
+        for m in rows:
+            edge = edges.setdefault(
+                (m.sender, m.recipient), {"messages": 0, "failed": 0}
+            )
+            edge["messages"] += 1
+            if m.state in ("FAILED", "DEAD", "EXPIRED"):
+                edge["failed"] += 1
+        return [
+            {"sender": sender, "recipient": recipient, **counts}
+            for (sender, recipient), counts in sorted(
+                edges.items(), key=lambda kv: -kv[1]["messages"]
+            )[:limit]
+        ]
+
     def db(self):
         return self.ctx.db
 

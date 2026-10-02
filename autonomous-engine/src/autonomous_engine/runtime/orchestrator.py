@@ -39,7 +39,7 @@ from ..agents.director import DirectorAgent, DirectorProposal
 from ..agents.intent_compiler import IntentCompiler, ProjectIntent, literal_intent
 from ..agents.planner import PlannerAgent, fallback_plan
 from ..agents.product import ProductAgent, fallback_requirements
-from ..agents.qa import QAAgent, gap_task
+from ..agents.qa import QAAgent
 from ..agents.release import ReleaseAgent
 from ..agents.researcher import ResearchAgent
 from ..agents.reviewer import ReviewerAgent
@@ -49,7 +49,6 @@ from ..agents.tester import TesterAgent
 from ..core.events import EventTypes
 from ..core.state_machine import TaskState
 from ..core.store import (
-    CheckpointRecord,
     DecisionRecord,
     ProjectRecord,
     RunRecord,
@@ -66,9 +65,8 @@ from ..messaging import (
     MsgType,
 )
 from ..models.router import ModelRouter
-from ..verification.engine import CheckStatus, VerificationEngine, VerificationReport
-from ..verification.evidence import EvidenceRecord, EvidenceStore
-from ..verification.gate import evaluate_quality_gate
+from ..verification.engine import CheckStatus, VerificationReport
+from ..verification.evidence import EvidenceStore
 from .base import AgentDeps, AgentResult, AgentRunner
 from .budget import BudgetManager
 from .constitution import ensure_constitution
@@ -78,9 +76,10 @@ from .hooks import HookRunner
 from .lessons import lessons_context_section, record_decision_lessons, record_project_lessons
 from .locks import LockManager, resource_keys
 from .memory import memory_store
+from .orchestrator_lifecycle import LifecycleMixin
+from .orchestrator_quality import QualityGateMixin
 from .permissions import ToolBox
 from .review_board import ReviewBoard
-from .risk import high_risk_commands
 from .roadmap import milestone_self_evaluation, refresh_roadmap
 from .stop import StopEngine, StopReason, StopSignal
 
@@ -143,8 +142,13 @@ class RunResult:
         }
 
 
-class Orchestrator:
-    """Owns the loop, the state machine, and every side effect."""
+class Orchestrator(LifecycleMixin, QualityGateMixin):
+    """Owns the loop, the state machine, and every side effect.
+
+    Behaviour lives in focused mixins (#6): `LifecycleMixin` (escalation,
+    checkpoints) and `QualityGateMixin` (verification, review, security, QA).
+    This class keeps the loop, scheduling, and agent execution.
+    """
 
     def __init__(
         self,
@@ -235,6 +239,7 @@ class Orchestrator:
             workspace=self.workspace,
             store=self.store,
             git=self.git,
+            on_activity=self.emit,
         )
         self.runner = AgentRunner(self.deps, event_log=self.workspace.events, on_event=self._hook)
 
@@ -278,6 +283,7 @@ class Orchestrator:
             permissions=self.config.permission_for(agent_class),
             sandbox_backend=self.config.sandbox_backend,
             sandbox_image=self.config.sandbox_image,
+            prefer_docker_high_risk=self.config.prefer_docker_high_risk,
             allow_high_risk=approved,
             budget=self.budget,
             workspace=self.workspace,
@@ -505,6 +511,15 @@ class Orchestrator:
         ensure_constitution(self.workspace, self.config, objective)
         self._load_state()
         self.recover_stale_tasks()
+        # Directive #5: a verification interrupted by a process death is not
+        # evidence — reconcile in-flight checks before any task runs.
+        from ..verification.project_gates import reconcile_after_restart
+
+        reconciliation = reconcile_after_restart(self.workspace, self.graph)
+        if reconciliation.get("reconciled"):
+            self.emit(
+                "verification.reconciled_after_restart", tasks=reconciliation["reconciled"]
+            )
         self._preflight_dirty_repo()
 
         self.store.start_run(self.run)
@@ -557,7 +572,14 @@ class Orchestrator:
                     if reopened:
                         stop = None
                 if stop is not None:
-                    break
+                    if stop.reason == StopReason.NO_PROGRESS:
+                        # Continuous Objective Mode: before accepting a
+                        # NO_PROGRESS stop, give the maintenance generators a
+                        # chance to produce real work from repository state.
+                        if self._generate_maintenance_backlog():
+                            stop = None
+                    else:
+                        break
 
             started = time.perf_counter()
             try:
@@ -954,15 +976,6 @@ class Orchestrator:
             )
         return await self._execute_task(task)
 
-    def _needs_approval(self, task: Task) -> bool:
-        if self.config.run_mode != "supervised" or task.id in self._approved_tasks:
-            return False
-        if task.risk == "high":
-            return True
-        # A task whose verification commands include HIGH-risk operations
-        # needs a human to see them before they run (OpenHands ConfirmRisky).
-        return bool(high_risk_commands(list(task.verification_commands)))
-
     def _idle_report(self) -> CycleReport:
         """Nothing runnable. Waiting is progress-neutral, not a failure."""
         if self.graph.active_tasks():
@@ -973,12 +986,44 @@ class Orchestrator:
             return CycleReport(
                 action="blocked", ok=True, detail=f"blocked by dependencies: {blocked}"
             )
+        # Continuous Objective Mode (directive #1): an empty graph is not a
+        # dead end — real repository signals become maintenance work so the
+        # runtime keeps producing value instead of NO_PROGRESS-stopping.
+        if self._generate_maintenance_backlog():
+            return CycleReport(
+                action="maintenance_backlog",
+                ok=True,
+                detail="objective complete; maintenance work queued",
+            )
         return CycleReport(
             action="idle",
             ok=False,
             detail="no runnable task and nothing in flight",
             evidence=self.director.status_report(self.graph),
         )
+
+    def _generate_maintenance_backlog(self) -> int:
+        """Continuous Objective Mode: turn repository signals into real tasks.
+
+        Returns the number of tasks added (0 = nothing found, the run may
+        stop). Bounded per round so a single cycle cannot flood the plan.
+        """
+        from .maintenance import maintenance_round
+
+        try:
+            result = maintenance_round(self.workspace, self.graph)
+        except Exception as exc:
+            self.emit("maintenance.error", detail=str(exc)[:200])
+            return 0
+        if result["added"]:
+            self._persist_graph()
+            self.emit(
+                "maintenance.backlog_generated",
+                added=result["added"],
+                tasks=result["tasks"],
+                kinds=result["kinds"],
+            )
+        return int(result["added"])
 
     def _select_runnable(self, preferred: list[str]) -> list[str]:
         """Deterministic selection: director's preference first, then ready order.
@@ -1566,80 +1611,6 @@ class Orchestrator:
             return blocked
         return self._complete_task(task, attempt, result, report)
 
-    async def _review_and_security(
-        self,
-        task: Task,
-        attempt: AttemptRecord,
-        report: VerificationReport,
-        *,
-        work_root: Path | None = None,
-    ) -> CycleReport | None:
-        """Independent review + red-team pass before completion.
-
-        Shared by inline and worktree execution so a parallel task meets the
-        same completion contract as a sequential one. Returns a failed
-        CycleReport when a gate blocks the task, None to proceed.
-        """
-        repo = work_root if work_root is not None else self.repo_root
-        if self._needs_review(task, report):
-            self._transition(
-                task, TaskState.REVIEWING, agent="orchestrator", note="independent review"
-            )
-            reviewer = self.reviewer
-            reviewer.bind_tools(self.tools_for(reviewer.agent_class, work_root=repo))
-            review_context = self.context_builder.build(
-                task=task,
-                role="reviewer",
-                repo_root=repo,
-                extra_sections={"change_diff": self._diff_section(None if repo is self.repo_root else repo)},
-            )
-            review_result = await self.runner.run(reviewer, task, review_context)
-            self._record_budget(review_result, reviewer.name)
-            review_findings = (review_result.output or {}).get("findings", [])
-            review_blocking = [
-                f for f in review_findings if f.get("severity") in ("critical", "high")
-            ]
-            self._msg_review_result(task, review_findings, len(review_blocking))
-            self.workspace.write_json_artifact(
-                f"verification/review_results/{task.id}.json", review_result.output or {}
-            )
-            findings = (review_result.output or {}).get("findings", [])
-            blocking = [f for f in findings if f.get("severity") in ("critical", "high")]
-            if (review_result.output or {}).get("blocking") and not blocking:
-                blocking = [
-                    {"severity": "high", "description": "reviewer marked the change blocking"}
-                ]
-            if blocking:
-                return await self._fail_task(
-                    task,
-                    attempt,
-                    f"review blocked by {len(blocking)} high-severity finding(s)",
-                    agent="reviewer",
-                    report=report,
-                )
-            if not review_result.ok:
-                # A review without blocking findings is recorded evidence, not
-                # a verdict: executable evidence decides completion.
-                self.emit(
-                    "review.non_blocking",
-                    task_id=task.id,
-                    findings=len(findings),
-                    error=review_result.error[:200],
-                )
-
-        # ---- SECURITY: high-risk changes get a red-team pass before completion ----
-        if task.risk == "high":
-            security_result = await self._run_security(task, work_root=work_root)
-            if security_result is not None and not security_result.ok:
-                return await self._fail_task(
-                    task,
-                    attempt,
-                    "security review found blocking findings; see the security report",
-                    agent="security",
-                    report=report,
-                )
-        return None
-
     def _needs_review(self, task: Task, report: VerificationReport) -> bool:
         """Deterministic review policy: risk and unverified criteria decide."""
         if task.risk == "high":
@@ -1723,68 +1694,6 @@ class Orchestrator:
         unresolved = [c for c in report.checks if c.status != CheckStatus.PASS]
         return bool(unresolved) and all(c.status == CheckStatus.UNKNOWN for c in unresolved)
 
-    async def _adjudicate_manual(
-        self, task: Task, report: VerificationReport, *, work_root: Path | None = None
-    ) -> bool:
-        """Reviewer verdict on manual criteria; UNKNOWN is never auto-passed."""
-        reviewer = self.reviewer
-        reviewer.bind_tools(self.tools_for(reviewer.agent_class, work_root=work_root))
-        manual = [c.criterion for c in report.checks if c.status == CheckStatus.UNKNOWN]
-        context = self.context_builder.build(
-            task=task,
-            role="reviewer",
-            repo_root=work_root or self.repo_root,
-            extra_sections={
-                "manual_criteria": (
-                    "# MANUAL CRITERIA TO ADJUDICATE\n"
-                    "Inspect the repository and decide whether each criterion holds.\n"
-                    + "\n".join(f"- {c}" for c in manual)
-                )
-            },
-        )
-        result = await self.runner.run(reviewer, task, context)
-        self._record_budget(result, reviewer.name)
-        self.workspace.write_json_artifact(
-            f"verification/review_results/{task.id}-manual.json", result.output or {}
-        )
-        if result.ok and (result.output or {}).get("approved"):
-            for check in report.checks:
-                if check.status == CheckStatus.UNKNOWN:
-                    check.status = CheckStatus.PASS
-                    check.detail = "approved by independent review (manual criterion)"
-            self.emit("verification.manual_approved", task_id=task.id, criteria=len(manual))
-            return True
-        for check in report.checks:
-            if check.status == CheckStatus.UNKNOWN:
-                check.status = CheckStatus.FAIL
-                check.detail = "reviewer could not approve this manual criterion"
-            if check.status == CheckStatus.FAIL and not any(
-                check.criterion in f for f in report.failures
-            ):
-                report.failures.append(f"{check.criterion} (not approved by review)")
-        return False
-
-    async def _run_security(self, task: Task, *, work_root: Path | None = None) -> AgentResult | None:
-        """Red-team pass for high-risk work; static evidence plus model review."""
-        repo = work_root if work_root is not None else self.repo_root
-        security = self.agents["security"]
-        security.bind_tools(self.tools_for(security.agent_class, work_root=repo))
-        context = self.context_builder.build(task=task, role="security", repo_root=repo)
-        result = await self.runner.run(security, task, context)
-        self._record_budget(result, security.name)
-        self.workspace.write_json_artifact(
-            f"verification/review_results/{task.id}-security.json", result.output or {}
-        )
-        self.emit(
-            "security.scan",
-            task_id=task.id,
-            ok=result.ok,
-            findings=len((result.output or {}).get("findings", [])),
-        )
-        return result
-
-    # ---- QA gate and release (plan.md §5K, §5L, §30) ----
-
     async def _convene_board(self, reason: str, task_ids: list[str]) -> Any:
         """Convene the Architecture Review Board at most once per question."""
         key = ",".join(sorted(task_ids))
@@ -1797,52 +1706,6 @@ class Orchestrator:
         except Exception as exc:
             self.emit("review_board.failed", detail=str(exc)[:300])
             return None
-
-    async def _run_qa_gate(self) -> bool:
-        """Validate the finished graph against the original intent.
-
-        Returns True when the gate found unmet requirements and reopened the
-        graph with catch-up tasks; False when the objective is satisfied (or
-        the QA verdict is not actionable).
-        """
-        self._qa_rounds += 1
-        qa = self.agents["qa"]
-        qa.bind_tools(self.tools_for(qa.agent_class))
-        intent = self._current_intent()
-        context = self.context_builder.build(
-            task=None,
-            role="qa",
-            repo_root=self.repo_root,
-            extra_sections={"intent": f"# ORIGINAL INTENT\n\n{intent.to_markdown()}"},
-        )
-        result = await self.runner.run(qa, None, context)
-        self._record_budget(result, qa.name)
-        if result.ok and result.output:
-            gaps = [str(g) for g in result.output.get("gaps", []) or []]
-            aligned = bool(result.output.get("aligned", True)) and not gaps
-            summary = str(result.output.get("summary", ""))
-        else:
-            # No QA verdict available: fall back to the deterministic
-            # coverage check so the gate never silently passes.
-            check = qa.deterministic_check(intent, self.graph)
-            gaps = check.gaps
-            aligned = check.aligned
-            summary = check.summary
-        self.emit("qa.gate", round=self._qa_rounds, aligned=aligned, gaps=gaps[:10])
-        self.workspace.write_json_artifact(
-            "verification/qa_gate.json", {"aligned": aligned, "gaps": gaps, "summary": summary}
-        )
-        if aligned and not gaps:
-            return False
-        new_tasks = [gap_task(gap, self.graph) for gap in gaps[:5]]
-        if not new_tasks:
-            return False
-        self.planner.replan(
-            self.graph, add_tasks=new_tasks, reason=f"QA gate: unmet requirements ({summary[:120]})"
-        )
-        self._persist_graph()
-        self.emit(EventTypes.TASK_CREATED, count=len(new_tasks), source="qa-gate")
-        return True
 
     async def _release(self) -> None:
         """Release step on a successful completion: notes, tag, checkpoint."""
@@ -1939,94 +1802,6 @@ class Orchestrator:
             self.emit("unknown.researched", unknown_id=unknown_id, resolved=resolved)
         else:
             self.emit("unknown.research_failed", unknown_id=unknown_id, error=result.error[:200])
-
-    async def _verify(self, task: Task, *, work_root: Path) -> VerificationReport:
-        risky = high_risk_commands(list(task.verification_commands))
-        if risky:
-            # Observability regardless of mode: the human (and the log) sees
-            # exactly which high-risk operations verification will attempt.
-            self.emit(
-                "security.high_risk_command",
-                task_id=task.id,
-                commands=[c for c, _ in risky],
-                reasons=[r for _, r in risky],
-                approved=task.id in self._approved_tasks,
-            )
-        engine = VerificationEngine(
-            self.tools_for("tester", work_root=work_root, approved=task.id in self._approved_tasks)
-        )
-        report = await asyncio.to_thread(engine.verify_task, task)
-        for check in report.checks:
-            if check.status == CheckStatus.UNKNOWN:
-                self.emit(
-                    "verification.unknown",
-                    task_id=task.id,
-                    criterion=check.criterion,
-                    detail="a manual criterion is never counted as a pass",
-                )
-        if report.passed:
-            self.emit(
-                EventTypes.VERIFICATION_PASSED,
-                task_id=task.id,
-                summary=report.summary(),
-                commands=[e.command for e in report.evidence],
-            )
-        else:
-            self.emit(
-                EventTypes.VERIFICATION_FAILED,
-                task_id=task.id,
-                summary=report.summary(),
-                failures=report.failures[:5],
-            )
-        self._record_quality_gate(task, report)
-        return report
-
-    def _record_quality_gate(self, task: Task, report: VerificationReport) -> None:
-        """Persist an evidence record and the deterministic gate verdict.
-
-        The gate is the auditable answer to "what proves this task?" — same
-        evidence + same policy always yields the same verdict, and an agent
-        claim without executable evidence can never produce PASSED (§48/§49).
-        """
-        try:
-            commit_sha = self.git.head_commit() if self.git.is_repo() else ""
-            dirty = self.git.is_dirty()
-        except Exception:
-            commit_sha, dirty = "", False
-        round_number = len(self.evidence_store.history(task.id)) + 1
-        record, _classes = EvidenceRecord.from_report(
-            report,
-            task_id=task.id,
-            round_number=round_number,
-            commit_sha=commit_sha,
-            workspace_dirty=dirty,
-        )
-        flaky = self.evidence_store.flaky_score(task.id)
-        self.evidence_store.record(record)
-        self.emit(
-            EventTypes.EVIDENCE_RECORDED,
-            task_id=task.id,
-            evidence_id=record.evidence_id,
-            commit=record.commit_sha[:12],
-            passed=record.passed,
-        )
-        if flaky:
-            self.emit(EventTypes.FLAKY_TEST_DETECTED, task_id=task.id)
-        gate = evaluate_quality_gate(
-            report,
-            self.config.verification,
-            task_declared_criteria=bool(task.definition_of_done or task.acceptance_criteria),
-            flaky_history=flaky,
-        )
-        self.emit(
-            EventTypes.QUALITY_GATE_EVALUATED,
-            task_id=task.id,
-            status=gate.status.value,
-            checks_passed=gate.checks_passed,
-            checks_total=gate.checks_total,
-            missing_evidence=gate.missing_evidence[:3],
-            commit=record.commit_sha[:12],
-        )
 
     def _diff_section(self, repo_root: Path | None = None) -> str:
         try:
@@ -2480,70 +2255,6 @@ class Orchestrator:
     # escalation, checkpoints, and the public inspection surface
     # ==================================================================
 
-    def _escalate(
-        self, task_id: str, reason: str, *, kind: str, evidence: str = ""
-    ) -> dict[str, Any]:
-        escalation = {
-            "id": new_id("ESC"),
-            "task_id": task_id,
-            "kind": kind,
-            "reason": reason,
-            "evidence": evidence,
-            "status": "pending",
-            "created_at": now_iso(),
-        }
-        self.workspace.add_escalation(escalation)
-        self.emit(EventTypes.ESCALATION_RAISED, task_id=task_id, kind=kind, reason=reason[:300])
-        return escalation
-
-    def _checkpoint(self, task: Task, label: str) -> None:
-        """Commit verified work and record a restorable checkpoint."""
-        commit = ""
-        if self.config.git_checkpoints:
-            try:
-                commit = self.git.create_checkpoint_commit(
-                    task.id, f"checkpoint({label}): {task.title} [{task.id}]"
-                )
-                if commit:
-                    self.emit(EventTypes.COMMIT_CREATED, task_id=task.id, commit=commit[:12])
-            except GitError as exc:
-                self.emit("git.checkpoint_failed", task_id=task.id, detail=str(exc))
-
-        self._checkpoint_counter = (
-            max(
-                self._checkpoint_counter,
-                len(self.workspace.list_checkpoints()),
-            )
-            + 1
-        )
-        checkpoint_id = f"checkpoint-{self._checkpoint_counter:04d}"
-        record = CheckpointRecord(
-            id=checkpoint_id,
-            project_id=self.store.project_id,
-            run_id=self.run.id,
-            git_commit=commit,
-            objective=self.ctx.objective[:500],
-            outstanding_failures=[f.id for f in self.store.list_failures()][-5:],
-            environment={"python": self._python_version(), "cwd": str(self.repo_root)},
-            task_graph=self.graph.model_dump(mode="json"),
-            project_state={"progress": self.graph.progress(), "budget": self.budget.snapshot()},
-        )
-        try:
-            self.store.save_checkpoint(record)
-            self.workspace.save_checkpoint(
-                checkpoint_id,
-                {
-                    "id": checkpoint_id,
-                    "git_commit": commit,
-                    "label": label,
-                    "task": task.id,
-                    "created_at": record.created_at,
-                },
-            )
-            self.emit(EventTypes.CHECKPOINT_CREATED, checkpoint=checkpoint_id, commit=commit[:12])
-        except Exception as exc:
-            self.emit("checkpoint.error", checkpoint=checkpoint_id, detail=str(exc))
-
     @staticmethod
     def _python_version() -> str:
         import sys
@@ -2575,23 +2286,6 @@ class Orchestrator:
             "task": task.model_dump(mode="json"),
             "verification": task.verification,
             "attempts": [a.model_dump(mode="json") for a in task.attempts_history],
-        }
-
-    def restore_checkpoint(self, checkpoint_id: str) -> dict[str, Any]:
-        """Restore a checkpoint's task graph (git is restored separately)."""
-        record = self.store.get_checkpoint(checkpoint_id)
-        if record is None:
-            raise KeyError(f"unknown checkpoint: {checkpoint_id}")
-        self.graph = TaskGraph.model_validate(record.task_graph)
-        self.workspace.save_graph(self.graph)
-        self.store.save_graph(self.graph)
-        self.emit(
-            EventTypes.CHECKPOINT_RESTORED, checkpoint=checkpoint_id, commit=record.git_commit[:12]
-        )
-        return {
-            "checkpoint": checkpoint_id,
-            "git_commit": record.git_commit,
-            "progress": self.graph.progress(),
         }
 
     # Agents referenced only through `self.agents`; keep the names importable.

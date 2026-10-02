@@ -294,8 +294,12 @@ async def test_tui_small_terminal_renders(ran_project: Path):
 
 
 async def test_tui_objective_submission_starts_attached_run(ran_project: Path):
-    """Submitting an objective launches the real runtime in the background."""
-    app = EngineTUI(ran_project, attached=True)
+    """Submitting an objective launches the real runtime in the background.
+
+    The TUI is a pure client now (directive #2): with no live daemon the
+    explicit in-process fallback keeps this legacy contract working.
+    """
+    app = EngineTUI(ran_project, attached=True, process_fallback=True)
     async with app.run_test(size=(110, 34)) as pilot:
         await pilot.pause()
         input_bar = app.query_one("#input-bar")

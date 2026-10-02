@@ -19,6 +19,10 @@ git checkpoints and worktree parallelism, event sourcing, budgets, resource
 locks, supervised approval gates, and crash recovery. The default provider is
 an offline `echo` model used for testing; real providers (OpenAI-compatible,
 Anthropic, local) plug in via configuration with no orchestrator changes.
+For unattended runs, `auto supervise` keeps the daemon alive across process
+crashes and `auto supervisor install` registers it with the OS (Windows Task
+Scheduler with restart-on-failure, systemd, or launchd) so autonomy survives
+logoffs and reboots — see `docs/DAEMON.md`.
 
 ## Quick start
 
@@ -71,6 +75,9 @@ auto hooks                           List event hooks and recent runs
 auto events [-n 50]                  Tail the event log
 auto config --set budget.max_token_budget=500
 auto reset --hard --yes              Destroy project state (keeps repository)
+auto supervise                       Daemon under a crash-restarting supervisor
+auto supervisor install|status|uninstall
+                                     OS registration (Task Scheduler/systemd/launchd)
 ```
 
 ## What the runtime owns vs. what models own

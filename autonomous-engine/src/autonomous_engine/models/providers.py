@@ -24,6 +24,8 @@ from .base import (
     ToolCall,
     Usage,
 )
+from .ratelimit import limiter_for
+from .streaming import global_observer
 
 # Rough offline cost model for budget accounting (USD / 1M tokens). These are
 # intentionally conservative estimates, not billing truth.
@@ -218,6 +220,17 @@ class OpenAICompatProvider(ProviderAdapter):
     def _allow_private(self) -> bool:
         return os.environ.get("AUTO_ALLOW_PRIVATE_ENDPOINTS", "").lower() in {"1", "true", "yes"}
 
+    def _provider_key(self) -> str:
+        """Rate-limit identity from the endpoint host (kios→5 RPM, atria→30)."""
+        from urllib.parse import urlparse
+
+        host = (urlparse(self.base_url).hostname or "").lower()
+        if "kios" in host:
+            return "kios"
+        if "atria" in host or "aria" in host:
+            return "atria"
+        return "openai"
+
     async def complete(self, request: CompletionRequest, model: str) -> ModelResponse:
         endpoint = f"{self.base_url.rstrip('/')}/chat/completions"
         try:
@@ -258,6 +271,18 @@ class OpenAICompatProvider(ProviderAdapter):
             headers["Authorization"] = f"Bearer {api_key}"
 
         started = time.perf_counter()
+        # Documented rate limits (Kios 5 RPM, Atria 30 RPM) are enforced at
+        # the single choke point every model call passes through.
+        await limiter_for(self._provider_key()).acquire()
+        observer = global_observer()
+        call_id = f"{model}-{int(started)}"
+        observer.emit_delta(
+            agent=str(request.metadata.get("agent", "")),
+            model=model,
+            provider=self.name,
+            delta="",
+            call_id=call_id,
+        )
         try:
             async with httpx.AsyncClient(timeout=self.timeout) as client:
                 resp = await client.post(endpoint, json=body, headers=headers)
@@ -295,6 +320,24 @@ class OpenAICompatProvider(ProviderAdapter):
             raise ModelError(
                 f"malformed provider response: {exc}", provider=self.name, model=model
             ) from exc
+        # Stream the produced text as bounded deltas (chunked); the UI renders
+        # live model work without ever seeing prompts or credentials.
+        for index in range(0, len(text), 240):
+            observer.emit_delta(
+                agent=str(request.metadata.get("agent", "")),
+                model=model,
+                provider=self.name,
+                delta=text[index : index + 240],
+                call_id=call_id,
+            )
+        observer.emit_delta(
+            agent=str(request.metadata.get("agent", "")),
+            model=model,
+            provider=self.name,
+            delta="",
+            call_id=call_id,
+            final=True,
+        )
 
         usage_raw = data.get("usage", {}) or {}
         tokens_in = int(usage_raw.get("prompt_tokens", _rough_token_count(request.prompt)))

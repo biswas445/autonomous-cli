@@ -220,6 +220,9 @@ class ProjectConfig(BaseModel):
     # "docker" runs agent commands inside a container.
     sandbox_backend: Literal["process", "docker"] = "process"
     sandbox_image: str = "python:3.12-slim"
+    # Directive #10: HIGH-risk commands that would be refused on the host run
+    # inside the Docker sandbox instead, when Docker is available.
+    prefer_docker_high_risk: bool = True
     # User-defined event hooks from .agents/hooks.json (never fatal).
     hooks_enabled: bool = True
     # Agentic tool loop: let agents read/search/run during their reasoning.

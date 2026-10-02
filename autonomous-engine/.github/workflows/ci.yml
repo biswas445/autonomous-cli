@@ -1,0 +1,45 @@
+# CI (directives #8 and #11): Windows + Linux matrix, lint, type check,
+# tests, and a coverage floor. The suite is fully offline (echo provider).
+
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install
+        run: pip install -e ".[dev]" pre-commit
+
+      - name: Lint (ruff)
+        run: python -m ruff check src tests
+
+      - name: Secret scan (gitleaks-style)
+        run: python tools/secret_scan.py $(git ls-files)
+        shell: bash
+
+      - name: Type check (mypy, advisory baseline)
+        run: python -m mypy src/autonomous_engine
+        continue-on-error: true
+
+      - name: Tests + coverage (Windows-safe paths exercised here)
+        run:
+          python -m pytest --cov=autonomous_engine --cov-report=term-missing
+          --cov-fail-under=70

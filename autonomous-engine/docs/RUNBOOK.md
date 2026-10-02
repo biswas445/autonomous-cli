@@ -187,6 +187,23 @@ failure) get bounded automatic restarts (`--max-restarts`, default 5). The
 daemon's liveness is in `.agents/execution/daemon.json`; every cycle state is
 persisted, so killing the daemon and re-running it loses nothing.
 
+## Unattended operation: process supervisor + OS registration
+
+`auto daemon` is one Python process; the supervisor keeps that process alive
+across crashes, and the OS registration keeps the supervisor alive across
+logoffs and reboots (full reference: `docs/DAEMON.md`):
+
+```bash
+auto supervise               # daemon as a child process: crash → restart, forever
+auto supervisor install      # Windows Scheduled Task / systemd / launchd at logon
+auto supervisor status       # registration + live supervisor/daemon pids
+auto supervisor uninstall    # deregister
+```
+
+`auto stop` ends a supervised daemon cleanly (exit 0 — the supervisor honors
+it); a crashed daemon is restarted with exponential backoff within a bounded
+budget that healthy runs reset.
+
 ## Inspecting the system
 
 ```bash

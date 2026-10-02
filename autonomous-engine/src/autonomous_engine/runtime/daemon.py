@@ -283,6 +283,20 @@ def json_dumps(payload: dict[str, Any]) -> str:
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def daemon_exit_code(report: DaemonReport) -> int:
+    """CLI exit contract for `auto daemon` (supervisor-facing).
+
+    The process supervisor treats any non-zero child exit as a crash and
+    restarts the daemon — so an operator-requested stop must be a *clean*
+    exit, or `auto stop` could never end a supervised daemon (the supervisor
+    would revive it seconds later, forever). Genuine dead ends — gave_up,
+    budget walls, safety blocks — still report failure (2).
+    """
+    if report.status == "completed" or report.reason == StopReason.USER_REQUESTED.value:
+        return 0
+    return 2
+
+
 def wait_for_file_change(path, timeout: float) -> bool:
     """Test helper: block (thread) until `path` exists or timeout elapses."""
     deadline = time.time() + timeout

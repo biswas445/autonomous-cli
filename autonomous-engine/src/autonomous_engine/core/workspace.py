@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -132,10 +133,25 @@ def atomic_write(path: Path, content: str) -> None:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        tmp.replace(path)
+        _replace_with_retry(tmp, path)
     except OSError:
         tmp.unlink(missing_ok=True)
         raise
+
+
+def _replace_with_retry(tmp: Path, path: Path, *, attempts: int = 6) -> None:
+    """os.replace can fail with a transient Windows sharing violation
+    (WinError 5) while another handle on the target is closing — e.g. a
+    concurrent reader of events.jsonl. Retry with backoff before giving up.
+    """
+    for attempt in range(attempts):
+        try:
+            tmp.replace(path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.05 * (2**attempt))
 
 
 def atomic_write_json(path: Path, payload: Any) -> None:

@@ -296,3 +296,89 @@ def test_cli_remember_and_instructions(project: Path):
     assert shown.exit_code == 0
     assert "Keep modules small." in shown.output
     assert "user-global" in shown.output
+
+
+async def test_live_activity_events_flow_from_model_and_tools(project, echo):
+    """Directive #12: model calls and tool executions emit real activity
+    events that observers (TUI/IPC) can watch — no simulated traffic."""
+    from autonomous_engine.runtime.context_setup import open_context
+    from autonomous_engine.runtime.orchestrator import Orchestrator
+
+    context = open_context(project)
+    orchestrator = Orchestrator(context, use_model_director=False)
+    result = await orchestrator.run_loop("Build the observable target")
+    assert result.status == "completed"
+
+    events = [e["event"] for e in context.workspace.events.read_all()]
+    assert "agent.started" in events
+    assert "agent.finished" in events
+    # the echo provider answers without tools, so model.response must exist
+    assert "model.response" in events, "model output must be observable"
+    response = [e for e in context.workspace.events.read_all() if e["event"] == "model.response"][0]
+    assert response["chars"] > 0
+    assert response["agent"]
+    context.db.close()
+
+
+async def test_tool_calls_emit_live_observability_events(project, echo):
+    """Tool executions stream tool.call/tool.observation events live.
+
+    A scripted router drives the real ToolLoop and the real sandbox: first it
+    requests a `list_dir` tool call, then it answers — exactly the traffic a
+    real model produces, observed through the event log.
+    """
+    from autonomous_engine.core.task import Task
+    from autonomous_engine.models.base import ModelResponse, ToolCall, Usage
+    from autonomous_engine.runtime.context import ContextBuilder
+    from autonomous_engine.runtime.context_setup import open_context
+    from autonomous_engine.runtime.orchestrator import Orchestrator
+
+    class ScriptedRouter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def complete(self, request, role, **kwargs) -> ModelResponse:
+            self.calls += 1
+            if self.calls == 1:
+                return ModelResponse(
+                    text="",
+                    usage=Usage(tokens_in=10, tokens_out=5, cost_usd=0.0),
+                    latency_ms=1.0,
+                    tool_calls=[
+                        ToolCall(id="t1", name="list_dir", arguments={"path": "."})
+                    ],
+                )
+            return ModelResponse(
+                text='{"answer": "listed", "sources": []}',
+                usage=Usage(tokens_in=20, tokens_out=10, cost_usd=0.0),
+                latency_ms=2.0,
+            )
+
+    context = open_context(project)
+    orchestrator = Orchestrator(context, use_model_director=False)
+    scripted = ScriptedRouter()
+    orchestrator.deps.router = scripted  # agents read the router via deps
+    task = Task(id="TASK-OBS", title="look around", role="research")
+    orchestrator.graph.add_task(task)
+    researcher = orchestrator.agents["researcher"]
+    researcher.bind_tools(
+        orchestrator.tools_for("researcher", approved=False)
+    )
+    builder = ContextBuilder(context.workspace)
+    builder.build(task=task, role="researcher", repo_root=orchestrator.repo_root)
+    payload, usage = await researcher.ask_model_with_tools(
+        system=researcher.SYSTEM,
+        prompt='Inspect the repository: list files, then answer as {"answer": "...", "sources": []}',
+        schema_hint="JSON with answer and sources",
+        tool_names=("list_dir", "search"),
+    )
+    assert payload.get("answer") == "listed"
+    assert usage["tool_loop"]["tool_calls"] == 1
+    events = [e["event"] for e in context.workspace.events.read_all()]
+    assert "model.call" in events
+    assert "model.response" in events
+    assert "tool.call" in events, "tool execution must be observable live"
+    assert "tool.observation" in events
+    observation = [e for e in context.workspace.events.read_all() if e["event"] == "tool.observation"][0]
+    assert observation["ok"] is True
+    context.db.close()

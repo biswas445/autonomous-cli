@@ -14,6 +14,7 @@ Two layers, mirroring the repo's integration-first convention:
 from __future__ import annotations
 
 from collections import Counter
+from datetime import UTC
 
 import pytest
 
@@ -573,3 +574,78 @@ async def test_role_addressed_director_resolves_to_runtime_identity(service):
     from autonomous_engine.messaging.models import DIRECTOR
 
     assert service.resolve_recipient("director") == DIRECTOR
+
+
+async def test_thread_length_limit_rejects_unbounded_conversations(service):
+    """§68: a conversation cannot grow without bound (CRITICAL exempt)."""
+    from autonomous_engine.messaging.models import MsgPriority
+
+    service.max_thread_length = 3
+    first = service.send(
+        msg_type=MsgType.STATUS_REQUEST,
+        sender="orchestrator",
+        recipient="coder",
+        payload={"question": "status?"},
+    )
+    for _ in range(2):
+        service.send(
+            msg_type=MsgType.STATUS_RESPONSE,
+            sender="coder",
+            recipient="orchestrator",
+            payload={"status": "ok"},
+            parent=first,
+        )
+    with pytest.raises(MessageRejected, match="thread"):
+        service.send(
+            msg_type=MsgType.STATUS_RESPONSE,
+            sender="coder",
+            recipient="orchestrator",
+            payload={"status": "overflow"},
+            parent=first,
+        )
+    # CRITICAL still gets through: safety reporting never dies of policy
+    critical = service.send(
+        msg_type=MsgType.BLOCKER_REPORTED,
+        sender="coder",
+        recipient="orchestrator",
+        payload={"task_id": "T", "blocker_type": "runtime", "description": "urgent"},
+        parent=first,
+        priority=MsgPriority.CRITICAL,
+    )
+    assert critical.priority.value == "critical"
+
+
+async def test_dead_letter_retention_purges_old_and_overflowing_dead(service):
+    """§35: dead letters are retained briefly, then purged; the population
+    is capped so months of runs cannot accumulate them forever."""
+    from datetime import datetime, timedelta
+
+
+    old_cutoff = (
+        (datetime.now(UTC) - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
+    service.max_retries = 1  # single failure dead-letters immediately
+    made = []
+    for i in range(5):
+        msg = service.send(
+            msg_type=MsgType.STATUS_RESPONSE,
+            sender="tester",
+            recipient="coder",
+            payload={"status": f"n{i}"},
+        )
+        service.fail_processing(msg, "handler gone")
+        made.append(msg)
+    assert service.store.dead_population() == 5
+    # age three of them beyond the cutoff
+    for msg in made[:3]:
+        msg.status_detail = ""
+        service.store.db.execute(
+            "UPDATE messages SET created_at = ? WHERE id = ?", (old_cutoff, msg.id)
+        )
+    service.dead_retention_days = 7
+    service.expire_stale()
+    assert service.store.dead_population() == 2  # the 3 old ones were purged
+    # now cap the population: keep only 1
+    service.max_dead_messages = 1
+    service.expire_stale()
+    assert service.store.dead_population() == 1

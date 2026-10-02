@@ -650,7 +650,7 @@ def daemon(
     max_cycles: int = typer.Option(200, "--max-cycles", help="Cycles per orchestrated run."),
 ) -> None:
     """Long-running mode: keep executing, resolving human gates as they open (§45)."""
-    from ..runtime.daemon import DaemonLoop
+    from ..runtime.daemon import DaemonLoop, daemon_exit_code
 
     context = _context(path)
     console.print(
@@ -682,8 +682,221 @@ def daemon(
         console.print("[yellow]daemon interrupted; state was persisted[/yellow]")
         raise typer.Exit(130) from exc
     _print_json(report.as_dict())
-    if report.status != "completed":
+    code = daemon_exit_code(report)
+    if code:
+        raise typer.Exit(code)
+
+
+@app.command()
+def supervise(
+    path: str = typer.Option("", "--path"),
+    max_restarts: int = typer.Option(
+        10, "--max-restarts", help="Consecutive crashes before the supervisor gives up."
+    ),
+    restart_delay: float = typer.Option(
+        2.0, "--restart-delay", help="Base delay between restarts (exponential backoff)."
+    ),
+    healthy_reset_seconds: float = typer.Option(
+        600.0, "--healthy-reset", help="A child running this long resets the crash budget."
+    ),
+) -> None:
+    """Run the daemon under a process supervisor: crash → restart, forever.
+
+    Register with the OS so this survives terminal closure and reboots:
+    `auto supervisor install` (Scheduled Task on Windows, systemd/launchd
+    elsewhere). State: `.agents/execution/supervisor.json`.
+    """
+    from ..runtime.supervisor import Supervisor, SupervisorError, SupervisorSettings
+
+    root = _resolve_root(path)
+    settings = SupervisorSettings(
+        restart_delay_base=restart_delay,
+        max_restarts=max_restarts,
+        healthy_reset_seconds=healthy_reset_seconds,
+    )
+    try:
+        supervisor = Supervisor(root, settings)
+    except SupervisorError as exc:
+        _fail(str(exc))
+        return
+    console.print(
+        Panel(
+            f"[bold]supervisor[/bold] {root.name}\n"
+            f"watching: auto daemon (restart on crash, max {max_restarts} consecutive)\n"
+            f"[dim]stop with Ctrl+C — remove from OS startup: auto supervisor uninstall[/dim]",
+            border_style="cyan",
+        )
+    )
+    try:
+        report = supervisor.run()
+    except SupervisorError as exc:
+        # e.g. the single-instance lock: another supervisor is watching.
+        _fail(str(exc))
+        return
+    _print_json(report.as_dict())
+    if report.status == "gave_up":
         raise typer.Exit(2)
+
+
+supervisor_app = typer.Typer(help="OS registration for the daemon supervisor (P1 #5).")
+app.add_typer(supervisor_app, name="supervisor")
+
+
+@supervisor_app.command("install")
+def supervisor_install(path: str = typer.Option("", "--path")) -> None:
+    """Register the supervisor with the OS (at logon, restart-on-failure)."""
+    from ..runtime.supervisor_service import RegistrationError, install
+
+    root = _resolve_root(path)
+    try:
+        registration = install(root)
+    except RegistrationError as exc:
+        _fail(f"registration failed: {exc}")
+        return
+    console.print(
+        f"[green]registered[/green] {registration.name} ({registration.platform})\n"
+        f"[dim]{registration.detail}[/dim]\n"
+        f"The supervised daemon starts at logon and is restarted on failure. "
+        f"Remove with: auto supervisor uninstall"
+    )
+
+
+@supervisor_app.command("uninstall")
+def supervisor_uninstall(path: str = typer.Option("", "--path")) -> None:
+    """Remove the OS registration for this project's supervisor."""
+    from ..runtime.supervisor_service import RegistrationError, uninstall
+
+    root = _resolve_root(path)
+    try:
+        uninstall(root)
+    except RegistrationError as exc:
+        _fail(f"unregister failed: {exc}")
+        return
+    console.print("[yellow]unregistered[/yellow] — the supervisor no longer starts with the OS")
+
+
+@supervisor_app.command("status")
+def supervisor_status(path: str = typer.Option("", "--path")) -> None:
+    """Show the OS registration and the live supervisor/daemon state."""
+    import os
+
+    from ..runtime.supervisor import Supervisor
+    from ..runtime.supervisor_service import status as service_status
+
+    root = _resolve_root(path)
+    console.print(f"OS registration: {service_status(root)}")
+    state = Supervisor(root).read_state()
+    if not state:
+        console.print("[dim]supervisor has never run for this project[/dim]")
+        return
+    pid = int(state.get("supervisor_pid") or 0)
+    child_pid = int(state.get("child_pid") or 0)
+    alive = "alive" if pid == os.getpid() or _pid_alive_best_effort(pid) else "not running"
+    child = "running" if child_pid and _pid_alive_best_effort(child_pid) else "—"
+    console.print(
+        f"supervisor: {state.get('status')} ({alive}, pid {pid or '—'}) · "
+        f"daemon: {child} (pid {child_pid or '—'}) · "
+        f"restarts: {state.get('restarts', 0)} · "
+        f"heartbeat: {state.get('last_heartbeat', '—')}"
+    )
+
+
+def _pid_alive_best_effort(pid: int) -> bool:
+    from ..runtime.supervisor import _pid_alive
+
+    return _pid_alive(pid)
+
+
+runtime_app = typer.Typer(help="Own the runtime as a daemon process; TUI/CLI are clients (directive #2).")
+app.add_typer(runtime_app, name="runtime")
+
+
+@runtime_app.command("start")
+def runtime_start(
+    path: str = typer.Option("", "--path"),
+    transport: str = typer.Option("auto", "--transport", help="auto | named_pipe | tcp"),
+) -> None:
+    """Start the persistent runtime daemon for this project (blocks)."""
+    import os as _os
+
+    from ..runtime.runtime_server import RuntimeServer
+
+    root = _resolve_root(path)
+    try:
+        server = RuntimeServer(root, prefer_transport=transport)
+    except FileNotFoundError as exc:
+        _fail(str(exc))
+        return
+    console.print(
+        Panel(
+            f"[bold]runtime daemon[/bold] {root.name}\n"
+            f"transport: {server.transport_name} · pid {_os.getpid()}\n"
+            f"[dim]clients attach with: auto ui / auto runtime status[/dim]",
+            border_style="cyan",
+        )
+    )
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        console.print("[yellow]runtime daemon stopped; endpoint cleared[/yellow]")
+
+
+@runtime_app.command("status")
+def runtime_status(path: str = typer.Option("", "--path")) -> None:
+    """Show the live runtime daemon endpoint, heartbeat, and run state."""
+    from ..runtime import ipc
+    from ..runtime.runtime_server import is_runtime_alive
+
+    root = _resolve_root(path)
+    alive, endpoint = is_runtime_alive(root)
+    doc = ipc.read_endpoint(root) or {}
+    if not alive:
+        console.print("[yellow]no live runtime daemon[/yellow]"
+                      + (f" (stale endpoint from pid {doc.get('pid')})" if doc else ""))
+        raise typer.Exit(1)
+    assert endpoint is not None
+    console.print(
+        f"[green]live[/green] {endpoint.transport} · pid {endpoint.pid} · "
+        f"heartbeat {endpoint.heartbeat_at}\n"
+        f"address: {endpoint.address}"
+    )
+    client = _runtime_client_or_fail(root)
+    if client is None:
+        return
+    try:
+        _print_json(client.status())
+    finally:
+        client.close()
+
+
+def _runtime_client_or_fail(root: Path):
+    from ..runtime.runtime_server import RuntimeClient
+
+    client = RuntimeClient(root)
+    if not client.connect():
+        _fail("runtime daemon is not reachable (start with `auto runtime start`)")
+        return None
+    return client
+
+
+@runtime_app.command("stop")
+def runtime_stop(
+    path: str = typer.Option("", "--path"),
+    reason: str = typer.Option("stopped via CLI", "--reason"),
+) -> None:
+    """Ask the runtime daemon to stop the current run and shut down."""
+    from ..runtime.runtime_server import RuntimeClient
+
+    root = _resolve_root(path)
+    client = RuntimeClient(root)
+    if not client.connect():
+        _fail("no live runtime daemon")
+        return
+    try:
+        client.stop_run(reason)
+        console.print("[green]stop requested[/green] — the daemon exits after the current cycle")
+    finally:
+        client.close()
 
 
 @app.command()
@@ -715,7 +928,7 @@ def microagents(
         console.print("      [dim]see .agents/microagents/README.md for the format[/dim]")
         return
     matched_names = (
-        {a.name for a in matched_microagents(context.workspace, match)} if match else None
+        {a.name for a in matched_microagents(context.workspace, match)} if match else set()
     )
     table = Table(title="microagents", show_header=True, header_style="bold")
     for column in ("name", "triggers", "chars", "fires" if match else ""):
@@ -774,7 +987,7 @@ def tools(
         agent_class, DEFAULT_PERMISSION_CLASSES["coder"]
     )
 
-    def _available(names: tuple[str, ...]) -> list[str]:
+    def _available(names: list[str] | tuple[str, ...]) -> list[str]:
         allowed: list[str] = []
         for name in names:
             if name == "run_command" and not permissions.run_commands:
@@ -1287,6 +1500,92 @@ def verify_stale_cmd(
     for task_id, evidence_sha in stale:
         console.print(f"[yellow]stale:[/yellow] {task_id} verified at {evidence_sha[:12]}, HEAD is {current[:12]}")
     console.print("[dim]re-verify with: auto verify task <task-id>[/dim]")
+
+
+@verify_app.command("gate")
+def verify_gate_cmd(
+    path: str = typer.Option("", "--path"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Evaluate the milestone/project quality gates from persisted evidence."""
+    from ..verification.project_gates import evaluate_project_gate
+
+    context = _context(path)
+    graph = context.workspace.load_graph()
+    node = evaluate_project_gate(context.workspace, graph, context.config.verification)
+    payload = node.as_dict()
+    if json_output:
+        _print_json(payload)
+        return
+    color = "green" if node.ok else "red"
+    console.print(f"[{color}]project gate: {node.status.value}[/{color}] ({node.detail.get('milestones', 0)} milestones)")
+    for child in node.children:
+        mark = "[green]✓[/green]" if child.ok else "[red]✗[/red]"
+        console.print(f"  {mark} {child.name}: {child.status.value}")
+        for grandchild in child.children[:8]:
+            sub = "[green]✓[/green]" if grandchild.ok else "[red]✗[/red]"
+            console.print(f"      {sub} {grandchild.name}: {grandchild.status.value}")
+    for reason in node.blocking[:5]:
+        console.print(f"  [red]blocking:[/red] {reason}")
+
+
+@verify_app.command("regressions")
+def verify_regressions_cmd(
+    path: str = typer.Option("", "--path"),
+    json_output: bool = typer.Option(False, "--json"),
+) -> None:
+    """Compare the latest coverage run against the persisted baseline (ratchet)."""
+    from ..verification.project_gates import compare_coverage, load_coverage_baseline
+
+    context = _context(path)
+    baseline = load_coverage_baseline(context.workspace)
+    if baseline is None:
+        _fail("no coverage baseline; run `auto verify baseline --total-lines N --covered-lines M` after a coverage run")
+        return
+    comparison = compare_coverage(
+        context.workspace,
+        current_total=int(baseline.get("total_lines", 0)),
+        current_covered=int(baseline.get("covered_lines", 0)),
+    )
+    payload = comparison.as_dict()
+    payload["note"] = (
+        "baseline present; supply a fresh coverage run via the reconciliation "
+        "API or rerun after the next verification pass"
+    )
+    if json_output:
+        _print_json(payload)
+        return
+    console.print(
+        f"baseline {payload['baseline_pct']:.1f}% · current {payload['current_pct']:.1f}% · "
+        f"delta {payload['delta_pct']:+.1f}%"
+    )
+    for rel in payload["regressed_files"]:
+        console.print(f"  [red]regressed:[/red] {rel}")
+    for rel in payload["improved_files"]:
+        console.print(f"  [green]improved:[/green] {rel}")
+    for rel in payload["new_files"]:
+        console.print(f"  [cyan]new:[/cyan] {rel}")
+
+
+@verify_app.command("baseline")
+def verify_baseline_cmd(
+    total_lines: int = typer.Option(..., "--total-lines", help="Total executable lines from the coverage report."),
+    covered_lines: int = typer.Option(..., "--covered-lines", help="Covered lines from the coverage report."),
+    commit: str = typer.Option("", "--commit"),
+    path: str = typer.Option("", "--path"),
+) -> None:
+    """Record (or update) the coverage baseline used by the ratchet policy."""
+    from ..verification.project_gates import save_coverage_baseline
+
+    context = _context(path)
+    payload = save_coverage_baseline(
+        context.workspace,
+        total_lines=total_lines,
+        covered_lines=covered_lines,
+        commit=commit,
+    )
+    pct = 100.0 * payload["covered_lines"] / max(1, payload["total_lines"])
+    console.print(f"[green]baseline saved[/green] {pct:.1f}% ({payload['covered_lines']}/{payload['total_lines']} lines)")
 
 
 @verify_app.command("policy")

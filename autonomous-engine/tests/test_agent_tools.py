@@ -383,3 +383,46 @@ def test_toolbox_write_tracking_accumulates(tmp_path):
     execute_tool(tools, "write_file", {"path": "src/a.py", "content": "a2"})
     execute_tool(tools, "write_file", {"path": "src/b.py", "content": "b"})
     assert tools.written_paths == ["src/a.py", "src/b.py"]  # deduplicated, ordered
+
+
+def test_high_risk_command_runs_in_docker_when_available(tmp_path, monkeypatch):
+    """Directive #10: a HIGH-risk command that would be refused on the host is
+    docker-isolated instead when Docker is available and the flag is set."""
+    from autonomous_engine.runtime.permissions import ToolBox as Box
+    from autonomous_engine.runtime.tools import execute_tool
+
+    tools = Box(
+        work_root=tmp_path,
+        permissions=PermissionClass(
+            name="coder", read_repo=True, run_commands=True,
+            # the allowlist admits rm*; the risk analyzer is the backstop that
+            # would refuse `rm -rf` on the host — exactly the docker case
+            allowed_command_globs=["rm*"], allow_high_risk=False,
+        ),
+        prefer_docker_high_risk=True,
+    )
+    seen: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        seen.append(list(argv))
+        from autonomous_engine.runtime.permissions import CommandResult
+
+        return CommandResult(
+            command=" ".join(argv), returncode=0, stdout="isolated", stderr=""
+        )
+
+    monkeypatch.setattr(tools, "_docker_available", lambda: True)
+    monkeypatch.setattr(
+        "autonomous_engine.runtime.permissions.subprocess.run", fake_run
+    )
+    # rm -rf is HIGH-risk: without docker it is refused, with docker it is
+    # executed inside the container argv
+    result = execute_tool(tools, "run_command", {"command": "rm -rf build"})
+    assert "isolated" in result
+    assert seen and seen[0][:2] == ["docker", "run"], "must be containerized"
+    assert "rm" in seen[0]
+
+    # without docker availability, the refusal stands
+    monkeypatch.setattr(tools, "_docker_available", lambda: False)
+    out = execute_tool(tools, "run_command", {"command": "rm -rf build"})
+    assert "high-risk command refused" in out

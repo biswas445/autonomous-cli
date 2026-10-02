@@ -139,6 +139,51 @@ class MessageStore:
         )
         return int(row["n"]) if row else 0
 
+    def thread_length(self, conversation_id: str) -> int:
+        if not conversation_id:
+            return 0
+        row = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM messages WHERE conversation_id = ?",
+            (conversation_id,),
+        )
+        return int(row["n"]) if row else 0
+
+    def dead_population(self) -> int:
+        row = self.db.query_one(
+            "SELECT COUNT(*) AS n FROM messages WHERE state = 'DEAD'"
+        )
+        return int(row["n"]) if row else 0
+
+    def purge_dead(self, *, older_than: str = "", keep_newest: int = 0) -> int:
+        """Retention policy for dead letters (§35): delete DEAD messages older
+        than `older_than` (ISO timestamp) and/or trim to the `keep_newest`
+        most recent. Returns the number of rows removed. Audited upstream by
+        the caller via events; the DB rows themselves are gone for good, so
+        callers must only purge beyond what the operator considers auditable.
+        """
+        removed = 0
+        if older_than:
+            cursor_before = self.dead_population()
+            self.db.execute(
+                "DELETE FROM messages WHERE state = 'DEAD' AND created_at < ?",
+                (older_than,),
+            )
+            removed += cursor_before - self.dead_population()
+        if keep_newest >= 0:
+            overflow = self.dead_population() - keep_newest
+            if overflow > 0:
+                self.db.execute(
+                    """
+                    DELETE FROM messages WHERE state = 'DEAD' AND id IN (
+                        SELECT id FROM messages WHERE state = 'DEAD'
+                        ORDER BY created_at LIMIT ?
+                    )
+                    """,
+                    (overflow,),
+                )
+                removed += overflow
+        return removed
+
     def by_correlation(self, correlation_id: str) -> list[Message]:
         rows = self.db.query(
             "SELECT * FROM messages WHERE correlation_id = ? ORDER BY created_at",

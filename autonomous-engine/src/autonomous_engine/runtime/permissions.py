@@ -138,6 +138,10 @@ class ToolBox:
     # Risk gate (OpenHands analyzer pattern). HIGH-risk commands are refused
     # unless the permission class opts in, or a human approved this task.
     allow_high_risk: bool = False
+    # Directive #10: when a HIGH-risk command would be refused but Docker is
+    # available, run it inside the container instead — isolation instead of
+    # refusal. No effect when sandbox_backend is already "docker".
+    prefer_docker_high_risk: bool = False
     # Optional hooks for agent tools: the run budget (budget_status tool) and
     # the project workspace (save/recall memory tools). Absent in unit tests.
     budget: Any = None
@@ -254,7 +258,14 @@ class ToolBox:
             )
         allowed_high = self.allow_high_risk or self.permissions.allow_high_risk
         assessment = classify_command(command)
-        if assessment.risk == CommandRisk.HIGH and not allowed_high:
+        isolate_high_risk = (
+            assessment.risk == CommandRisk.HIGH
+            and not allowed_high
+            and self.prefer_docker_high_risk
+            and self.sandbox_backend == "process"
+            and self._docker_available()
+        )
+        if assessment.risk == CommandRisk.HIGH and not allowed_high and not isolate_high_risk:
             raise PermissionDenied(
                 f"high-risk command refused by the risk analyzer ({assessment.reason}): {command}"
             )
@@ -270,7 +281,7 @@ class ToolBox:
         if not argv:
             raise PermissionDenied("empty command")
 
-        if self.sandbox_backend == "docker":
+        if self.sandbox_backend == "docker" or isolate_high_risk:
             argv = self._docker_argv(argv)
 
         env = {k: v for k, v in os.environ.items() if k in set(self.env_allowlist)}
@@ -279,7 +290,7 @@ class ToolBox:
         try:
             proc = subprocess.run(  # noqa: S603 - argv list, shell=False
                 argv,
-                cwd=None if self.sandbox_backend == "docker" else str(self.work_root),
+                cwd=None if (self.sandbox_backend == "docker" or isolate_high_risk) else str(self.work_root),
                 capture_output=True,
                 text=True,
                 timeout=timeout or self.default_timeout,
@@ -316,6 +327,25 @@ class ToolBox:
             stderr=proc.stderr[-self.max_output_chars :],
             duration_ms=duration,
         )
+
+    _docker_available_cache: bool | None = None
+
+    @classmethod
+    def _docker_available(cls) -> bool:
+        """Is Docker usable? Checked once per process (directive #10)."""
+        if cls._docker_available_cache is None:
+            try:
+                proc = subprocess.run(  # noqa: S603 - fixed argv
+                    ["docker", "version", "--format", "ok"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                cls._docker_available_cache = proc.returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                cls._docker_available_cache = False
+        return cls._docker_available_cache
 
     def _docker_argv(self, command_argv: list[str]) -> list[str]:
         """Wrap the command for container execution (§61).

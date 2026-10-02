@@ -186,6 +186,7 @@ through the context builder or the tool loop without being marked.
 | §13 DoD engine | `verification/engine.py` |
 | §14 unknowns queue | store `unknowns` + `agents/researcher.py` |
 | §15/§16 escalation + modes | `stop.py`, orchestrator supervised gate, control channel |
+| §45 daemon + OS supervisor | `runtime/daemon.py`, `runtime/supervisor.py`, `runtime/supervisor_service.py` |
 | §18/§19 model routing | `models/router.py` |
 | §21 independent verification | reviewer/security agents + evidence rules |
 | §22/§23 parallelism + locks | `task.py.independent_wave`, `runtime/locks.py` |

@@ -113,6 +113,9 @@ class MessageService:
         agents: dict[str, AgentDescriptor] | None = None,
         max_retries: int = DEFAULT_MAX_RETRIES,
         rate_limit_per_minute: int = 60,
+        max_thread_length: int = 100,
+        dead_retention_days: int = 7,
+        max_dead_messages: int = 200,
     ):
         self.store = store
         self.events = events
@@ -120,6 +123,9 @@ class MessageService:
         self.agents = agents or default_agents()
         self.max_retries = max_retries
         self.rate_limit_per_minute = rate_limit_per_minute
+        self.max_thread_length = max_thread_length
+        self.dead_retention_days = dead_retention_days
+        self.max_dead_messages = max_dead_messages
         self._send_times: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=rate_limit_per_minute * 2))
         self._pending: dict[str, deque[str]] = defaultdict(lambda: deque(maxlen=200))
         self._loop_watcher: dict[str, deque[tuple[str, str]]] = defaultdict(lambda: deque(maxlen=12))
@@ -266,6 +272,19 @@ class MessageService:
             self._emit("message.rejected", message=message, reason="mailbox full")
             raise MailboxFull(f"mailbox for {resolved} is full ({descriptor.mailbox_limit} pending)")
 
+        # thread limit (§68): an unbounded conversation is an unbounded
+        # memory leak; CRITICAL always gets through, everything else is
+        # rejected once the thread hits the cap.
+        if (
+            priority is not MsgPriority.CRITICAL
+            and self.store.thread_length(conversation_id) >= self.max_thread_length
+        ):
+            self._emit("message.rejected", message=message, reason="thread too long")
+            raise MessageRejected(
+                f"thread {conversation_id} reached {self.max_thread_length} messages; "
+                "start a new conversation or escalate"
+            )
+
         # idempotency: same key returns the original message (§14)
         key = payload.get("idempotency_key")
         if key:
@@ -406,7 +425,13 @@ class MessageService:
         return True
 
     def expire_stale(self) -> int:
-        """EXPIRE messages past their expires_at (§13); auditable, not executed."""
+        """EXPIRE messages past their expires_at (§13); auditable, not executed.
+
+        Also applies the dead-letter retention policy (§35): DEAD messages
+        older than `dead_retention_days` are purged, and the dead population
+        is trimmed to `max_dead_messages` — a months-long runtime must not
+        accumulate dead letters forever.
+        """
         now = now_iso()
         rows: list[Message] = []
         for state in (DeliveryState.QUEUED, DeliveryState.DELIVERED, DeliveryState.RECEIVED):
@@ -418,6 +443,20 @@ class MessageService:
                 self.store.save(message)
                 self._emit("message.expired", message=message)
                 expired += 1
+        import datetime as _dt
+
+        cutoff = (
+            _dt.datetime.now(_dt.UTC) - _dt.timedelta(days=self.dead_retention_days)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        purged = self.store.purge_dead(
+            older_than=cutoff, keep_newest=self.max_dead_messages
+        )
+        if purged:
+            # not tied to one message: audit through the event log directly
+            import contextlib
+
+            with contextlib.suppress(Exception):
+                self.events.append("message.dead_purged", count=purged)
         return expired
 
 

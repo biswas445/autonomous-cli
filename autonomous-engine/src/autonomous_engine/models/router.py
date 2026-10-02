@@ -13,6 +13,7 @@ profile did not declare.
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
@@ -226,6 +227,36 @@ def ensure_default_providers() -> None:
     for adapter in (EchoProvider(), OpenAICompatProvider(), AnthropicProvider()):
         with contextlib.suppress(ValueError):  # already registered
             register_provider(adapter)
+
+
+def ensure_env_providers(start: Any = None) -> list[str]:
+    """Register one OpenAI-compatible adapter per `.env` provider section.
+
+    The `.env` blocks name providers (kios, atria, ...); routes reference
+    those names. Without this step every `kios`/`atria` route died with
+    "unknown provider". Idempotent: existing registrations are kept. Returns
+    the registered provider names. Never logs secret values.
+    """
+    import contextlib
+
+    from ..runtime.envfile import load_repo_env
+    from .providers import OpenAICompatProvider
+
+    registered: list[str] = []
+    sections = load_repo_env(start or Path.cwd())
+    for section in sections:
+        adapter = OpenAICompatProvider(
+            base_url=section.base_url,
+            api_key_env=f"AUTO_{section.name.upper()}_API_KEY",
+        )
+        # The registry keys on the class-level `name` ("openai"); a route that
+        # says `kios`/`atria` needs its own named adapter, so register the
+        # instance under the section's name instead.
+        adapter.name = section.name
+        with contextlib.suppress(ValueError):
+            register_provider(adapter, replace=True)
+        registered.append(section.name)
+    return registered
 
 
 ensure_default_providers()
